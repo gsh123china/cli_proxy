@@ -129,13 +129,90 @@ def main():
     
     # ui 命令
     ui_parser = subparsers.add_parser(
-        'ui', 
+        'ui',
         help='启动Web UI界面',
         description='启动Web UI界面来可视化代理状态',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   clp ui                        启动UI界面(默认端口3300)"""
     )
+
+    # auth 命令组
+    auth_parser = subparsers.add_parser(
+        'auth',
+        help='鉴权管理',
+        description='管理API鉴权token和配置',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  clp auth generate --name prod              生成新token
+  clp auth list                              列出所有token
+  clp auth on                                启用鉴权
+  clp auth off                               关闭鉴权
+  clp auth enable prod                       启用指定token
+  clp auth disable prod                      禁用指定token
+  clp auth remove prod                       删除指定token"""
+    )
+
+    auth_subparsers = auth_parser.add_subparsers(
+        dest='auth_command',
+        title='鉴权命令',
+        help='鉴权子命令'
+    )
+
+    # auth generate - 生成token
+    auth_generate = auth_subparsers.add_parser(
+        'generate',
+        help='生成新的鉴权token',
+        description='生成一个新的随机token用于API鉴权'
+    )
+    auth_generate.add_argument('--name', required=True, help='token名称（唯一标识）')
+    auth_generate.add_argument('--description', default='', help='token描述信息')
+    auth_generate.add_argument('--expires', help='过期时间（ISO格式，如 2025-12-31T23:59:59）')
+
+    # auth list - 列出所有token
+    auth_list = auth_subparsers.add_parser(
+        'list',
+        help='列出所有token',
+        description='显示所有已配置的鉴权token'
+    )
+
+    # auth on - 启用鉴权
+    auth_on = auth_subparsers.add_parser(
+        'on',
+        help='启用鉴权',
+        description='启用全局鉴权功能（需要重启服务）'
+    )
+
+    # auth off - 关闭鉴权
+    auth_off = auth_subparsers.add_parser(
+        'off',
+        help='关闭鉴权',
+        description='关闭全局鉴权功能（需要重启服务）'
+    )
+
+    # auth enable - 启用指定token
+    auth_enable = auth_subparsers.add_parser(
+        'enable',
+        help='启用指定token',
+        description='启用一个已禁用的token'
+    )
+    auth_enable.add_argument('name', help='token名称')
+
+    # auth disable - 禁用指定token
+    auth_disable = auth_subparsers.add_parser(
+        'disable',
+        help='禁用指定token',
+        description='禁用一个token（不删除）'
+    )
+    auth_disable.add_argument('name', help='token名称')
+
+    # auth remove - 删除token
+    auth_remove = auth_subparsers.add_parser(
+        'remove',
+        help='删除指定token',
+        description='永久删除一个token'
+    )
+    auth_remove.add_argument('name', help='token名称')
 
     # 解析参数
     args = parser.parse_args()
@@ -173,8 +250,110 @@ def main():
     elif args.command == 'ui':
         import webbrowser
         webbrowser.open("http://localhost:3300")
+    elif args.command == 'auth':
+        handle_auth_command(args)
     else:
         parser.print_help()
+
+
+def handle_auth_command(args):
+    """处理 auth 命令"""
+    from src.auth.auth_manager import AuthManager
+    from src.auth.token_generator import generate_token
+    from datetime import datetime
+
+    auth_manager = AuthManager()
+
+    if args.auth_command == 'generate':
+        # 生成新token
+        token = generate_token()
+        success = auth_manager.add_token(
+            token=token,
+            name=args.name,
+            description=args.description,
+            expires_at=args.expires
+        )
+
+        if success:
+            print(f"✓ Token 生成成功！")
+            print(f"名称: {args.name}")
+            print(f"Token: {token}")
+            print(f"\n请妥善保管此token，它将用于访问代理服务。")
+            if args.expires:
+                print(f"过期时间: {args.expires}")
+
+            # 检查鉴权是否启用
+            if not auth_manager.is_enabled():
+                print(f"\n提示: 当前鉴权未启用，运行 'clp auth on' 启用鉴权功能。")
+        else:
+            print(f"✗ Token 生成失败")
+
+    elif args.auth_command == 'list':
+        # 列出所有token
+        tokens = auth_manager.list_tokens()
+        enabled = auth_manager.is_enabled()
+
+        print(f"=== 鉴权Token列表 ===")
+        print(f"全局状态: {'已启用' if enabled else '已关闭'}\n")
+
+        if not tokens:
+            print("暂无配置的token")
+            print("\n运行 'clp auth generate --name <名称>' 创建新token")
+        else:
+            print(f"{'名称':<15} {'状态':<8} {'创建时间':<20} {'描述'}")
+            print("-" * 70)
+            for token in tokens:
+                name = token.get('name', 'N/A')
+                active = '启用' if token.get('active', True) else '禁用'
+                created = token.get('created_at', 'N/A')[:19]
+                description = token.get('description', '')
+                print(f"{name:<15} {active:<8} {created:<20} {description}")
+
+            print(f"\n共 {len(tokens)} 个token")
+
+    elif args.auth_command == 'on':
+        # 启用鉴权
+        auth_manager.set_enabled(True)
+        print("✓ 鉴权已启用")
+        print("\n提示: 请重启服务使配置生效: clp restart")
+
+        # 检查是否有可用token
+        tokens = auth_manager.list_tokens()
+        if not tokens:
+            print("\n警告: 尚未配置任何token，运行 'clp auth generate --name <名称>' 创建token")
+
+    elif args.auth_command == 'off':
+        # 关闭鉴权
+        auth_manager.set_enabled(False)
+        print("✓ 鉴权已关闭")
+        print("\n提示: 请重启服务使配置生效: clp restart")
+
+    elif args.auth_command == 'enable':
+        # 启用指定token
+        success = auth_manager.set_token_active(args.name, True)
+        if success:
+            print(f"✓ Token '{args.name}' 已启用")
+        else:
+            print(f"✗ 操作失败")
+
+    elif args.auth_command == 'disable':
+        # 禁用指定token
+        success = auth_manager.set_token_active(args.name, False)
+        if success:
+            print(f"✓ Token '{args.name}' 已禁用")
+        else:
+            print(f"✗ 操作失败")
+
+    elif args.auth_command == 'remove':
+        # 删除token
+        success = auth_manager.remove_token(args.name)
+        if success:
+            print(f"✓ Token '{args.name}' 已删除")
+        else:
+            print(f"✗ 操作失败")
+
+    else:
+        print("未知的auth命令，运行 'clp auth --help' 查看帮助")
 
 if __name__ == '__main__':
     main()

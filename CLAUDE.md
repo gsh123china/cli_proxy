@@ -64,6 +64,42 @@ CLP (CLI Proxy) 是一个本地AI代理工具，用于管理和转发 Claude 和
 - **CachedRequestFilter** (`src/filter/cached_request_filter.py`): 添加文件签名缓存
 - 过滤器支持对请求体的 `replace` 和 `remove` 操作
 
+### 鉴权系统
+- **AuthManager** (`src/auth/auth_manager.py`): Token 验证和配置管理核心
+  - 从 `~/.clp/auth.json` 加载配置
+  - 支持 token 过期时间和启用/禁用状态
+  - 使用文件签名缓存机制提升性能
+  - 提供完整的 token CRUD 接口
+
+- **中间件实现** (`src/auth/fastapi_middleware.py`, `src/auth/flask_middleware.py`):
+  - FastAPI 使用 BaseHTTPMiddleware 拦截所有请求
+  - Flask 使用 before_request 钩子验证请求
+  - 支持三种 token 提取方式：
+    1. `Authorization: Bearer clp_xxx` - 标准 Bearer 认证
+    2. `X-API-Key: clp_xxx` - 自定义 Header（推荐）
+    3. `?token=clp_xxx` - Query 参数（WebSocket）
+  - 白名单机制：`/health`, `/ping`, `/static/*` 等路径免鉴权
+
+- **Token 生成器** (`src/auth/token_generator.py`):
+  - 使用 `secrets` 模块生成密码学安全的随机字符串
+  - Base62 编码（0-9, a-z, A-Z）
+  - 默认 32 字符长度，`clp_` 前缀
+  - 通过前缀区分代理层和上游层认证
+
+**鉴权流程：**
+```
+客户端请求 → [鉴权中间件] → 现有代理逻辑 → 上游 API
+
+1. 中间件提取 token（Authorization/X-API-Key/Query）
+2. 验证 token 是否存在于 auth.json
+3. 检查 token 状态（active、expires_at）
+4. 验证通过 → 放行到代理逻辑
+5. 验证失败 → 返回 401 Unauthorized
+
+注意：代理逻辑中，客户端的 Authorization header 会被忽略，
+使用配置文件中的真实 API key 访问上游，两层认证完全独立。
+```
+
 ### 服务控制
 - **BaseServiceController** (`src/core/base_proxy.py:820`): 用于启动/停止服务的基础控制器
 - **Claude/Codex 控制器** (`src/claude/ctl.py`, `src/codex/ctl.py`): 服务特定控制器
@@ -186,6 +222,7 @@ lsof -ti:3210,3211,3300 | xargs kill -9
 - `~/.clp/claude.json` - Claude 配置文件
 - `~/.clp/codex.json` - Codex 配置文件
 - `~/.clp/filter.json` - 请求过滤规则
+- `~/.clp/auth.json` - 鉴权配置和 token 管理
 - `~/.clp/data/model_router_config.json` - 模型路由配置
 - `~/.clp/data/lb_config.json` - 负载均衡配置
 - `~/.clp/data/proxy_requests.jsonl` - 请求日志（最近 100 条记录）
@@ -200,6 +237,7 @@ lsof -ti:3210,3211,3300 | xargs kill -9
 4. **负载均衡**：使用基于权重或优先激活的策略在多个配置间分配请求
 5. **实时监控**：WebSocket 端点 `/ws/realtime` 用于实时请求跟踪
 6. **使用统计**：自动解析和记录 token 使用情况
+7. **鉴权保护**：Bearer Token 认证，保护公网部署的代理服务
 
 ## API 端点测试
 

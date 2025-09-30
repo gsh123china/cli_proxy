@@ -191,6 +191,170 @@ wire_api = "responses"
 ```
 3. 重启codex即可（确保本地代理已启动 clp start）
 
+## 鉴权配置
+
+### 功能说明
+
+CLP 提供 API Token 鉴权功能，用于保护部署在公网环境的代理服务。该功能采用 Bearer Token 认证方式，通过 `clp_` 前缀的 token 区分代理层和上游 API 认证。
+
+**特性：**
+- ✅ 支持 `Authorization: Bearer clp_xxx` 和 `X-API-Key: clp_xxx` 两种认证方式
+- ✅ 支持 WebSocket 连接鉴权（通过 query 参数）
+- ✅ Token 支持过期时间和启用/禁用状态
+- ✅ 默认关闭，不影响现有部署（向后兼容）
+- ✅ 服务级别控制（可单独控制 UI、Claude、Codex 服务的鉴权）
+
+### 快速开始
+
+#### 1. 生成鉴权 Token
+
+```bash
+# 生成新的 token
+clp auth generate --name production --description "生产环境token"
+
+# 输出示例：
+# ✓ Token 生成成功！
+# 名称: production
+# Token: clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+#
+# 请妥善保管此token，它将用于访问代理服务。
+```
+
+#### 2. 启用鉴权
+
+```bash
+# 启用鉴权功能
+clp auth on
+
+# 重启服务使配置生效
+clp restart
+```
+
+#### 3. 客户端使用
+
+**Python (Anthropic SDK):**
+```python
+import anthropic
+
+# 使用 X-API-Key 方式（推荐，避免与上游认证冲突）
+client = anthropic.Anthropic(
+    base_url="http://your-server:3210",
+    api_key="your-upstream-claude-key",
+    default_headers={
+        "X-API-Key": "clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+    }
+)
+```
+
+**cURL:**
+```bash
+# 方式 1: 使用 X-API-Key（推荐）
+curl http://your-server:3210/v1/messages \
+  -H "X-API-Key: clp_your_token_here" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# 方式 2: 使用 Authorization Bearer
+curl http://your-server:3210/v1/messages \
+  -H "Authorization: Bearer clp_your_token_here" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+**Web UI 访问:**
+```bash
+# 访问 UI 时，在浏览器中添加 header 或使用 query 参数
+http://your-server:3300?token=clp_your_token_here
+```
+
+### Token 管理命令
+
+```bash
+# 列出所有 token
+clp auth list
+
+# 输出示例：
+# === 鉴权Token列表 ===
+# 全局状态: 已启用
+#
+# 名称             状态     创建时间              描述
+# ----------------------------------------------------------------------
+# production      启用     2025-01-15T10:30:00   生产环境token
+# development     启用     2025-01-15T11:00:00   开发环境token
+#
+# 共 2 个token
+
+# 禁用指定 token（不删除）
+clp auth disable development
+
+# 启用已禁用的 token
+clp auth enable development
+
+# 删除 token（永久删除）
+clp auth remove development
+
+# 关闭鉴权（需要重启服务）
+clp auth off
+```
+
+### 配置文件
+
+鉴权配置保存在 `~/.clp/auth.json`：
+
+```json
+{
+  "enabled": true,
+  "tokens": [
+    {
+      "token": "clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+      "name": "production",
+      "description": "生产环境token",
+      "created_at": "2025-01-15T10:30:00",
+      "expires_at": null,
+      "active": true
+    }
+  ],
+  "services": {
+    "ui": true,
+    "claude": true,
+    "codex": true
+  }
+}
+```
+
+**配置说明：**
+- `enabled`: 全局鉴权开关
+- `tokens`: Token 列表
+  - `token`: 完整的 token 字符串
+  - `name`: 唯一标识符
+  - `description`: 描述信息
+  - `created_at`: 创建时间
+  - `expires_at`: 过期时间（null 表示永不过期）
+  - `active`: 是否启用
+- `services`: 各服务的鉴权开关
+
+### 安全建议
+
+#### Token 安全
+- ✅ 妥善保管 token，不要提交到代码仓库
+- ✅ 定期轮换 token（生成新 token，删除旧 token）
+- ✅ 为不同环境使用不同的 token
+- ✅ 设置 token 过期时间：`clp auth generate --name temp --expires 2025-12-31T23:59:59`
+- ✅ 不需要的 token 及时删除
+
+#### 鉴权与反向代理
+如果使用 Nginx/Caddy 等反向代理，建议：
+- 在反向代理层使用 Basic Auth 或 OAuth
+- CLP 层使用 Token 认证作为第二层防护
+- 两层认证提供更好的安全性
+
+#### 白名单路径
+以下路径无需鉴权（便于监控和健康检查）：
+- `/health` - 健康检查
+- `/ping` - 心跳检测
+- `/favicon.ico` - 图标
+- `/static/*` - 静态资源（仅 UI 服务）
+
 ## 部署与配置
 
 ### 监听地址配置
@@ -624,6 +788,7 @@ CMD ["clp", "start"]
 
 #### 公网部署安全清单
 
+- ✅ **启用 CLP 鉴权**：运行 `clp auth on` 并生成 token
 - ✅ 设置 `CLP_UI_HOST=127.0.0.1` 和 `CLP_PROXY_HOST=127.0.0.1`
 - ✅ 使用 Nginx/Caddy 等反向代理并配置 HTTPS
 - ✅ 启用反向代理的访问认证（Basic Auth 或 OAuth）
@@ -631,6 +796,7 @@ CMD ["clp", "start"]
 - ✅ 定期更新依赖和系统补丁
 - ✅ 使用非 root 用户运行服务
 - ✅ 监控日志文件 `~/.clp/run/*.log`
+- ✅ 定期轮换 API Token
 
 #### SSH 隧道访问（临时方案）
 

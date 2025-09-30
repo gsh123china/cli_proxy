@@ -33,6 +33,34 @@ if OLD_LOG_FILE.exists() and not LOG_FILE.exists():
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path='/static')
 
 
+# 初始化鉴权中间件
+def _setup_auth_middleware():
+    """设置鉴权中间件"""
+    try:
+        from src.auth.auth_manager import AuthManager
+        from src.auth.flask_middleware import FlaskAuthMiddleware
+
+        # 初始化鉴权管理器
+        auth_manager = AuthManager()
+
+        # 注册鉴权中间件
+        FlaskAuthMiddleware(
+            app=app,
+            auth_manager=auth_manager,
+            service_name='ui',
+            whitelist_paths={'/', '/health', '/ping', '/favicon.ico'},
+            whitelist_prefixes={'/static/'}
+        )
+    except ImportError as e:
+        print(f"警告: 鉴权模块加载失败，将不启用鉴权功能: {e}")
+    except Exception as e:
+        print(f"警告: 鉴权中间件初始化失败: {e}")
+
+
+# 初始化鉴权
+_setup_auth_middleware()
+
+
 def _safe_json_load(line: str) -> Dict[str, Any]:
     try:
         return json.loads(line)

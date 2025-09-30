@@ -84,6 +84,9 @@ class BaseProxyService(ABC):
         self._setup_routes()
         self.app.add_event_handler("shutdown", self._shutdown_event)
 
+        # 集成鉴权中间件
+        self._setup_auth_middleware()
+
         # 导入过滤器
         try:
             from ..filter.cached_request_filter import CachedRequestFilter
@@ -141,6 +144,28 @@ class BaseProxyService(ABC):
                 print(f"WebSocket连接异常: {e}")
             finally:
                 self.realtime_hub.disconnect(websocket)
+
+    def _setup_auth_middleware(self):
+        """设置鉴权中间件"""
+        try:
+            from ..auth.auth_manager import AuthManager
+            from ..auth.fastapi_middleware import AuthMiddleware
+
+            # 初始化鉴权管理器
+            auth_manager = AuthManager()
+
+            # 添加鉴权中间件
+            self.app.add_middleware(
+                AuthMiddleware,
+                auth_manager=auth_manager,
+                service_name=self.service_name,
+                whitelist_paths={'/health', '/ping', '/favicon.ico'}
+            )
+        except ImportError as e:
+            # 如果鉴权模块不存在，跳过（向后兼容）
+            print(f"警告: 鉴权模块加载失败，将不启用鉴权功能: {e}")
+        except Exception as e:
+            print(f"警告: 鉴权中间件初始化失败: {e}")
 
     async def log_request(
         self,
