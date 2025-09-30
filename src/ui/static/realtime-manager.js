@@ -71,8 +71,12 @@ class RealTimeManager {
             return;
         }
 
-        const wsUrl = `ws://${window.location.hostname}:${port}/ws/realtime`;
-        console.log(`正在连接 ${serviceName} WebSocket: ${wsUrl}`);
+        // 从 localStorage 获取 token 并添加到 URL
+        const token = localStorage.getItem('clp_auth_token') || '';
+        const wsUrl = token
+            ? `ws://${window.location.hostname}:${port}/ws/realtime?token=${encodeURIComponent(token)}`
+            : `ws://${window.location.hostname}:${port}/ws/realtime`;
+        console.log(`正在连接 ${serviceName} WebSocket: ${wsUrl.replace(/token=[^&]+/, 'token=***')}`);
 
         try {
             const ws = new WebSocket(wsUrl);

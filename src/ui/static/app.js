@@ -967,9 +967,69 @@ const app = createApp({
         };
 
         // API 请求方法
+        // Token 管理
+        const getAuthToken = () => {
+            return localStorage.getItem('clp_auth_token') || '';
+        };
+
+        const setAuthToken = (token) => {
+            if (token) {
+                localStorage.setItem('clp_auth_token', token);
+            } else {
+                localStorage.removeItem('clp_auth_token');
+            }
+        };
+
+        const promptForToken = async () => {
+            return new Promise((resolve) => {
+                ElMessageBox.prompt('请输入访问令牌 (Token)', '身份验证', {
+                    confirmButtonText: '确定',
+                    cancelButtonText: '取消',
+                    inputPlaceholder: '请输入 clp_ 开头的 token',
+                    inputPattern: /^clp_.+/,
+                    inputErrorMessage: 'Token 格式不正确，应以 clp_ 开头',
+                    closeOnClickModal: false,
+                    closeOnPressEscape: false,
+                    showClose: false
+                }).then(({ value }) => {
+                    setAuthToken(value);
+                    resolve(value);
+                }).catch(() => {
+                    ElMessage.warning('未输入令牌，将无法访问服务');
+                    resolve(null);
+                });
+            });
+        };
+
         const fetchWithErrorHandling = async (url, options = {}) => {
             try {
+                // 自动添加 token header
+                const token = getAuthToken();
+                if (token) {
+                    options.headers = options.headers || {};
+                    options.headers['X-API-Key'] = token;
+                }
+
                 const response = await fetch(url, options);
+
+                // 处理 401 未授权错误
+                if (response.status === 401) {
+                    ElMessage.warning('身份验证失败，请输入有效的访问令牌');
+                    const newToken = await promptForToken();
+                    if (newToken) {
+                        // 重试请求
+                        options.headers = options.headers || {};
+                        options.headers['X-API-Key'] = newToken;
+                        const retryResponse = await fetch(url, options);
+                        if (!retryResponse.ok) {
+                            throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`);
+                        }
+                        return await retryResponse.json();
+                    } else {
+                        throw new Error('未授权访问');
+                    }
+                }
+
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
