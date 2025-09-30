@@ -145,7 +145,7 @@ python3 -m venv clp-env
 source clp-env/bin/activate
 
 # 在虚拟环境中安装
-pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+pip install --force-reinstall ./dist/clp-1.11.0-py3-none-any.whl
 
 # 使用 clp 命令
 clp restart
@@ -160,12 +160,12 @@ deactivate
 pip install -e .
 
 # 方式 2：从 wheel 包安装（推荐）
-pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+pip install --force-reinstall ./dist/clp-1.11.0-py3-none-any.whl
 
 # 方式 3：在虚拟环境中安装（推荐用于生产环境）
 python3 -m venv clp-env
 source clp-env/bin/activate
-pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+pip install --force-reinstall ./dist/clp-1.11.0-py3-none-any.whl
 ```
 
 ### 构建与打包

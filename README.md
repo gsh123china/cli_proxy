@@ -90,7 +90,7 @@ python3 -m venv clp-env
 source clp-env/bin/activate
 
 # 安装 CLP
-pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+pip install --force-reinstall ./dist/clp-1.11.0-py3-none-any.whl
 
 # 使用 clp 命令
 clp start
@@ -102,7 +102,7 @@ deactivate
 ### 直接安装
 ```bash
 # 安装最新版本
-pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+pip install --force-reinstall ./dist/clp-1.11.0-py3-none-any.whl
 
 # 更新后需要重启服务新功能才生效（先杀掉clp占用的三个端口保险一点）
 # macOS / Linux
