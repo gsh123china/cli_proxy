@@ -2201,7 +2201,6 @@ const app = createApp({
             formatTimestamp,
             truncatePath,
             getStatusTagType,
-            formatHeaders,              // 新增
             getFilteredHeaders,         // 新增
             showLogDetail,
             viewAllLogs,
