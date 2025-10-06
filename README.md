@@ -209,13 +209,17 @@ CLP 提供 API Token 鉴权功能，用于保护部署在公网环境的代理�
 #### 1. 生成鉴权 Token
 
 ```bash
-# 生成新的 token
-clp auth generate --name production --description "生产环境token"
+# 为代理服务生成 token（只允许访问 Claude/Codex）
+clp auth generate --name codex-prod --services claude codex --description "生产环境token"
+
+# 为 Web UI 生成独立 token（具备管理权限）
+clp auth generate --name ui-admin --services ui --description "UI 管理员"
 
 # 输出示例：
 # ✓ Token 生成成功！
-# 名称: production
+# 名称: codex-prod
 # Token: clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+# 服务: claude, codex
 #
 # 请妥善保管此token，它将用于访问代理服务。
 ```
@@ -277,10 +281,10 @@ clp auth list
 # === 鉴权Token列表 ===
 # 全局状态: 已启用
 #
-# 名称             状态     创建时间              描述
-# ----------------------------------------------------------------------
-# production      启用     2025-01-15T10:30:00   生产环境token
-# development     启用     2025-01-15T11:00:00   开发环境token
+# 名称             状态     服务               创建时间              描述
+# ----------------------------------------------------------------------------------
+# codex-prod      启用     claude,codex      2025-01-15T10:30:00   生产环境token
+# ui-admin        启用     ui                2025-01-15T11:00:00   UI 管理员
 #
 # 共 2 个token
 
@@ -311,7 +315,8 @@ clp auth off
       "description": "生产环境token",
       "created_at": "2025-01-15T10:30:00",
       "expires_at": null,
-      "active": true
+      "active": true,
+      "services": ["claude", "codex"]
     }
   ],
   "services": {
@@ -338,7 +343,8 @@ clp auth off
 #### Token 安全
 - ✅ 妥善保管 token，不要提交到代码仓库
 - ✅ 定期轮换 token（生成新 token，删除旧 token）
-- ✅ 为不同环境使用不同的 token
+- ✅ 为不同服务（UI / Claude / Codex）和环境分别配置 token
+- ✅ 使用 `--services` 时至少选择一个合法服务，命令会在输入无效时终止
 - ✅ 设置 token 过期时间：`clp auth generate --name temp --expires 2025-12-31T23:59:59`
 - ✅ 不需要的 token 及时删除
 

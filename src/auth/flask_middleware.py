@@ -73,7 +73,7 @@ class FlaskAuthMiddleware:
         token = self._extract_token()
 
         # 验证 token
-        if not token or not self.auth_manager.verify_token(token):
+        if not token or not self.auth_manager.verify_token(token, self.service_name):
             return jsonify({
                 "error": "Unauthorized",
                 "message": "无效的认证令牌或令牌已过期"

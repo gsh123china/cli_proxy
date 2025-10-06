@@ -65,7 +65,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         token = self._extract_token(request)
 
         # 验证 token
-        if not token or not self.auth_manager.verify_token(token):
+        if not token or not self.auth_manager.verify_token(token, self.service_name):
             return JSONResponse(
                 status_code=401,
                 content={

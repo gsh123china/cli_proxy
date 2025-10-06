@@ -168,6 +168,12 @@ def main():
     auth_generate.add_argument('--name', required=True, help='token名称（唯一标识）')
     auth_generate.add_argument('--description', default='', help='token描述信息')
     auth_generate.add_argument('--expires', help='过期时间（ISO格式，如 2025-12-31T23:59:59）')
+    auth_generate.add_argument(
+        '--services',
+        nargs='+',
+        choices=['ui', 'claude', 'codex'],
+        help='允许访问的服务，默认覆盖全部服务'
+    )
 
     # auth list - 列出所有token
     auth_list = auth_subparsers.add_parser(
@@ -271,13 +277,16 @@ def handle_auth_command(args):
             token=token,
             name=args.name,
             description=args.description,
-            expires_at=args.expires
+            expires_at=args.expires,
+            services=args.services
         )
 
         if success:
             print(f"✓ Token 生成成功！")
             print(f"名称: {args.name}")
             print(f"Token: {token}")
+            services_display = ', '.join(args.services) if args.services else 'ui, claude, codex'
+            print(f"服务: {services_display}")
             print(f"\n请妥善保管此token，它将用于访问代理服务。")
             if args.expires:
                 print(f"过期时间: {args.expires}")
@@ -300,14 +309,22 @@ def handle_auth_command(args):
             print("暂无配置的token")
             print("\n运行 'clp auth generate --name <名称>' 创建新token")
         else:
-            print(f"{'名称':<15} {'状态':<8} {'创建时间':<20} {'描述'}")
-            print("-" * 70)
+            print(f"{'名称':<15} {'状态':<8} {'服务':<18} {'创建时间':<20} {'描述'}")
+            print("-" * 90)
             for token in tokens:
                 name = token.get('name', 'N/A')
                 active = '启用' if token.get('active', True) else '禁用'
-                created = token.get('created_at', 'N/A')[:19]
+                services = token.get('services')
+                if services is None:
+                    services_display = 'ui,claude,codex'
+                elif services:
+                    services_display = ','.join(services)
+                else:
+                    services_display = 'none'
+                created_raw = token.get('created_at', 'N/A')
+                created = created_raw[:19] if isinstance(created_raw, str) else 'N/A'
                 description = token.get('description', '')
-                print(f"{name:<15} {active:<8} {created:<20} {description}")
+                print(f"{name:<15} {active:<8} {services_display:<18} {created:<20} {description}")
 
             print(f"\n共 {len(tokens)} 个token")
 

@@ -10,6 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+# 支持的服务名称，保持与各服务的 service_name 一致
+SUPPORTED_SERVICES = ['ui', 'claude', 'codex']
+
 
 class AuthManager:
     """鉴权配置管理器"""
@@ -98,10 +101,67 @@ class AuthManager:
             normalized['enabled'] = bool(config['enabled'])
 
         if 'tokens' in config and isinstance(config['tokens'], list):
-            normalized['tokens'] = config['tokens']
+            normalized_tokens = []
+            for entry in config['tokens']:
+                normalized_entry = self._normalize_token_entry(entry)
+                if normalized_entry:
+                    normalized_tokens.append(normalized_entry)
+            normalized['tokens'] = normalized_tokens
 
         if 'services' in config and isinstance(config['services'], dict):
             normalized['services'].update(config['services'])
+
+        return normalized
+
+    def _normalize_token_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        """规范化单个 token 配置"""
+        if not isinstance(entry, dict):
+            return None
+
+        token_value = entry.get('token')
+        name = entry.get('name')
+        if not isinstance(token_value, str) or not token_value:
+            return None
+        if not isinstance(name, str) or not name:
+            return None
+
+        normalized_entry = {
+            "token": token_value,
+            "name": name,
+            "description": entry.get('description', ''),
+            "created_at": entry.get('created_at'),
+            "expires_at": entry.get('expires_at'),
+            "active": bool(entry.get('active', True)),
+            "services": self._normalize_services(entry.get('services'))
+        }
+
+        # 兼容旧字段，保留未知字段
+        for key, value in entry.items():
+            if key not in normalized_entry:
+                normalized_entry[key] = value
+
+        return normalized_entry
+
+    def _normalize_services(self, services: Any) -> List[str]:
+        """标准化 token 可访问的服务列表"""
+        if services is None:
+            return SUPPORTED_SERVICES.copy()
+
+        normalized: List[str] = []
+
+        if isinstance(services, str):
+            candidates = [services]
+        elif isinstance(services, list):
+            candidates = services
+        else:
+            return []
+
+        for service in candidates:
+            if not isinstance(service, str):
+                continue
+            service_name = service.strip().lower()
+            if service_name in SUPPORTED_SERVICES and service_name not in normalized:
+                normalized.append(service_name)
 
         return normalized
 
@@ -143,12 +203,13 @@ class AuthManager:
 
         return True
 
-    def verify_token(self, token: str) -> bool:
+    def verify_token(self, token: str, service: Optional[str] = None) -> bool:
         """
         验证 token 是否有效
 
         Args:
             token: 要验证的 token
+            service: 请求访问的服务名称
 
         Returns:
             True 如果有效，否则 False
@@ -160,19 +221,20 @@ class AuthManager:
         tokens = config.get('tokens', [])
 
         for token_entry in tokens:
-            if not isinstance(token_entry, dict):
+            normalized_entry = self._normalize_token_entry(token_entry)
+            if not normalized_entry:
                 continue
 
             # 检查 token 值
-            if token_entry.get('token') != token:
+            if normalized_entry.get('token') != token:
                 continue
 
             # 检查是否激活
-            if not token_entry.get('active', True):
+            if not normalized_entry.get('active', True):
                 continue
 
             # 检查是否过期
-            expires_at = token_entry.get('expires_at')
+            expires_at = normalized_entry.get('expires_at')
             if expires_at:
                 try:
                     expire_time = datetime.fromisoformat(expires_at)
@@ -181,11 +243,25 @@ class AuthManager:
                 except (ValueError, TypeError):
                     pass
 
+            # 检查服务范围
+            if service:
+                normalized_service = service.strip().lower()
+                services = normalized_entry.get('services', SUPPORTED_SERVICES)
+                if normalized_service not in services:
+                    continue
+
             return True
 
         return False
 
-    def add_token(self, token: str, name: str, description: str = "", expires_at: Optional[str] = None) -> bool:
+    def add_token(
+        self,
+        token: str,
+        name: str,
+        description: str = "",
+        expires_at: Optional[str] = None,
+        services: Optional[List[str]] = None
+    ) -> bool:
         """
         添加新 token
 
@@ -194,6 +270,7 @@ class AuthManager:
             name: token 名称（唯一标识）
             description: 描述信息
             expires_at: 过期时间（ISO格式字符串），None 表示永不过期
+            services: 可访问的服务列表
 
         Returns:
             True 如果添加成功，否则 False
@@ -208,13 +285,19 @@ class AuthManager:
                 return False
 
         # 添加新 token
+        normalized_services = self._normalize_services(services)
+        if services is not None and not normalized_services:
+            print("Token 服务范围无效：请至少指定一个有效服务 (ui/claude/codex)")
+            return False
+
         new_token = {
             "token": token,
             "name": name,
             "description": description,
             "created_at": datetime.now().isoformat(),
             "expires_at": expires_at,
-            "active": True
+            "active": True,
+            "services": normalized_services or SUPPORTED_SERVICES.copy()
         }
 
         tokens.append(new_token)
