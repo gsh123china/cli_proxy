@@ -96,6 +96,14 @@ class BaseProxyService(ABC):
             from ..filter.request_filter import filter_request_data
             self.filter_request_data = filter_request_data
             self.request_filter = None
+
+        # 导入 Header 过滤器
+        try:
+            from ..filter.cached_header_filter import CachedHeaderFilter
+            self.header_filter = CachedHeaderFilter()
+        except ImportError as e:
+            print(f"警告: Header 过滤器加载失败: {e}")
+            self.header_filter = None
     
     def _create_async_client(self) -> httpx.AsyncClient:
         """创建并配置 httpx AsyncClient"""
@@ -583,9 +591,21 @@ class BaseProxyService(ABC):
         if raw_query:
             target_url = f"{target_url}?{raw_query}"
 
-        # 处理headers，排除会被重新设置的头
+        # 处理headers
+        # 1. 应用 Header Filter 过滤敏感 headers（如果启用）
+        original_headers_dict = dict(request.headers)
+        if self.header_filter:
+            # 重新加载配置（使用缓存机制，仅在文件修改时重新加载）
+            self.header_filter.reload_config()
+            filtered_headers_dict = self.header_filter.filter_headers(original_headers_dict)
+        else:
+            filtered_headers_dict = original_headers_dict
+
+        # 2. 排除会被重新设置的头
         excluded_headers = {'authorization', 'host', 'content-length'}
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
+        headers = {k: v for k, v in filtered_headers_dict.items() if k.lower() not in excluded_headers}
+
+        # 3. 添加必要的 headers
         headers['host'] = urlsplit(target_url).netloc
         headers.setdefault('connection', 'keep-alive')
         if config_data.get('api_key'):

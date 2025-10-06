@@ -565,7 +565,19 @@ def get_status():
                         filter_count = 1
             except (json.JSONDecodeError, IOError):
                 filter_count = 0
-        
+
+        # 计算 Header Filter 配置数量
+        header_filter_file = Path.home() / '.clp' / 'header_filter.json'
+        header_filter_count = 0
+        if header_filter_file.exists():
+            try:
+                with open(header_filter_file, 'r', encoding='utf-8') as f:
+                    header_filter_data = json.load(f)
+                    if header_filter_data.get('enabled') and isinstance(header_filter_data.get('blocked_headers'), list):
+                        header_filter_count = len(header_filter_data['blocked_headers'])
+            except (json.JSONDecodeError, IOError):
+                header_filter_count = 0
+
         data = {
             'services': {
                 'claude': {
@@ -582,6 +594,7 @@ def get_status():
             'request_count': request_count,
             'config_count': total_configs,
             'filter_count': filter_count,
+            'header_filter_count': header_filter_count,
             'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'usage_summary': usage_summary
         }
@@ -734,6 +747,66 @@ def save_filter():
         
         return jsonify({'success': True, 'message': '过滤规则保存成功'})
     
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/header-filter', methods=['GET'])
+def get_header_filter():
+    """获取 Header 过滤配置"""
+    try:
+        filter_file = Path.home() / '.clp' / 'header_filter.json'
+
+        if not filter_file.exists():
+            default_config = {
+                'enabled': True,
+                'blocked_headers': [
+                    'x-forwarded-for',
+                    'x-forwarded-proto',
+                    'x-forwarded-scheme',
+                    'x-real-ip',
+                    'x-forwarded-host',
+                    'x-forwarded-port'
+                ]
+            }
+            return jsonify({'config': default_config})
+
+        with open(filter_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        return jsonify({'config': config})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/header-filter', methods=['POST'])
+def save_header_filter():
+    """保存 Header 过滤配置"""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'No configuration data provided'}), 400
+
+        if 'enabled' not in data or 'blocked_headers' not in data:
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        if not isinstance(data['blocked_headers'], list):
+            return jsonify({'error': 'blocked_headers must be an array'}), 400
+
+        normalized_headers = [h.lower().strip() for h in data['blocked_headers'] if h and h.strip()]
+
+        config = {
+            'enabled': bool(data['enabled']),
+            'blocked_headers': normalized_headers
+        }
+
+        filter_file = Path.home() / '.clp' / 'header_filter.json'
+
+        with open(filter_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+        return jsonify({'success': True, 'message': 'Header 过滤配置保存成功'})
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

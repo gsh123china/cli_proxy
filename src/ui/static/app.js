@@ -10,6 +10,7 @@ const app = createApp({
         const allLogsLoading = ref(false);
         const configSaving = ref(false);
         const filterSaving = ref(false);
+        const headerFilterSaving = ref(false);       // Header Filter saving state（新增）
         const lastUpdate = ref('加载中...');
         
         // 服务状态数据
@@ -30,7 +31,8 @@ const app = createApp({
         const stats = reactive({
             requestCount: 0,
             configCount: 0,
-            filterCount: 0
+            filterCount: 0,
+            headerFilterCount: 0       // Header Filter 数量（新增）
         });
         
         // 日志数据
@@ -47,7 +49,8 @@ const app = createApp({
         
         // 抽屉状态
         const configDrawerVisible = ref(false);
-        const filterDrawerVisible = ref(false);
+        const bodyFilterDrawerVisible = ref(false);      // Body Filter（原 filterDrawerVisible）
+        const headerFilterDrawerVisible = ref(false);    // Header Filter（新增）
         const logDetailVisible = ref(false);
         const allLogsVisible = ref(false);
         const activeConfigTab = ref('claude');
@@ -60,6 +63,12 @@ const app = createApp({
         });
         const filterContent = ref('');
         const filterRules = ref([]);  // 过滤规则数组
+
+        // Header Filter 配置（新增）
+        const headerFilterConfig = reactive({
+            enabled: true,
+            blocked_headers: []
+        });
 
         // 友好表单的配置数据
         const friendlyConfigs = reactive({
@@ -1066,6 +1075,7 @@ const app = createApp({
             stats.requestCount = data.request_count || 0;
             stats.configCount = data.config_count || 0;
             stats.filterCount = data.filter_count || 0;
+            stats.headerFilterCount = data.header_filter_count || 0;  // 新增
 
             const summary = data.usage_summary || null;
             if (summary) {
@@ -1504,9 +1514,9 @@ const app = createApp({
             await saveConfigForService(service);
         };
         
-        // 过滤器抽屉相关
-        const openFilterDrawer = async () => {
-            filterDrawerVisible.value = true;
+        // Body Filter 抽屉相关
+        const openBodyFilterDrawer = async () => {
+            bodyFilterDrawerVisible.value = true;
             await loadFilter();
         };
         
@@ -1524,10 +1534,103 @@ const app = createApp({
             filterRules.value.splice(index, 1);
         };
         
-        const closeFilterDrawer = () => {
-            filterDrawerVisible.value = false;
+        const closeBodyFilterDrawer = () => {
+            bodyFilterDrawerVisible.value = false;
         };
-        
+
+        // Header Filter 相关方法（新增）
+        const openHeaderFilterDrawer = async () => {
+            headerFilterDrawerVisible.value = true;
+            await loadHeaderFilter();
+        };
+
+        const closeHeaderFilterDrawer = () => {
+            headerFilterDrawerVisible.value = false;
+        };
+
+        const loadHeaderFilter = async () => {
+            try {
+                const data = await fetchWithErrorHandling('/api/header-filter');
+                headerFilterConfig.enabled = data.config.enabled ?? true;
+                headerFilterConfig.blocked_headers = data.config.blocked_headers || [];
+            } catch (error) {
+                headerFilterConfig.enabled = true;
+                headerFilterConfig.blocked_headers = [];
+                ElMessage.error('加载 Header 过滤配置失败: ' + error.message);
+            }
+        };
+
+        const saveHeaderFilter = async () => {
+            headerFilterSaving.value = true;
+            try {
+                const validHeaders = headerFilterConfig.blocked_headers.filter(h => h && h.trim());
+
+                const payload = {
+                    enabled: headerFilterConfig.enabled,
+                    blocked_headers: validHeaders
+                };
+
+                const response = await fetch('/api/header-filter', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    ElMessage.success(result.message);
+                    await refreshData();
+                } else {
+                    ElMessage.error(result.error || '保存失败');
+                }
+            } catch (error) {
+                ElMessage.error('保存 Header 过滤配置失败: ' + error.message);
+            } finally {
+                headerFilterSaving.value = false;
+            }
+        };
+
+        const addBlockedHeader = () => {
+            headerFilterConfig.blocked_headers.push('');
+        };
+
+        const removeBlockedHeader = (index) => {
+            headerFilterConfig.blocked_headers.splice(index, 1);
+        };
+
+        const applyHeaderPreset = (preset) => {
+            if (preset === 'privacy') {
+                headerFilterConfig.enabled = true;
+                headerFilterConfig.blocked_headers = [
+                    'x-forwarded-for',
+                    'x-forwarded-proto',
+                    'x-forwarded-scheme',
+                    'x-real-ip',
+                    'x-forwarded-host',
+                    'x-forwarded-port',
+                    'x-forwarded-server',
+                    'cf-connecting-ip',
+                    'cf-ipcountry',
+                    'true-client-ip'
+                ];
+                ElMessage.success('已应用隐私保护模式');
+            } else if (preset === 'debug') {
+                headerFilterConfig.enabled = false;
+                headerFilterConfig.blocked_headers = [];
+                ElMessage.success('已应用调试模式（全透传）');
+            } else if (preset === 'default') {
+                headerFilterConfig.enabled = true;
+                headerFilterConfig.blocked_headers = [
+                    'x-forwarded-for',
+                    'x-forwarded-proto',
+                    'x-forwarded-scheme',
+                    'x-real-ip'
+                ];
+                ElMessage.success('已应用默认配置');
+            }
+        };
+
         const loadFilter = async () => {
             try {
                 const data = await fetchWithErrorHandling('/api/filter');
@@ -1645,7 +1748,20 @@ const app = createApp({
             if (status >= 500) return 'danger';
             return '';
         };
-        
+
+        const getFilteredHeaders = (log) => {
+            const original = log.original_headers || {};
+            const target = log.target_headers || {};
+
+            const filtered = [];
+            for (const key in original) {
+                if (!(key in target)) {
+                    filtered.push(`${key}: ${original[key]}`);
+                }
+            }
+            return filtered;
+        };
+
         // 日志详情相关方法
         const decodeBodyContent = (encodedContent) => {
             if (!encodedContent) {
@@ -2030,7 +2146,8 @@ const app = createApp({
             claudeConfigs,
             codexConfigs,
             configDrawerVisible,
-            filterDrawerVisible,
+            bodyFilterDrawerVisible,        // 重命名
+            headerFilterDrawerVisible,      // 新增
             logDetailVisible,
             allLogsVisible,
             activeConfigTab,
@@ -2038,6 +2155,8 @@ const app = createApp({
             configContents,
             filterContent,
             filterRules,
+            headerFilterConfig,             // 新增
+            headerFilterSaving,             // 新增
             selectedLog,
             decodedRequestBody,
             decodedOriginalRequestBody,
@@ -2066,15 +2185,24 @@ const app = createApp({
             openConfigDrawer,
             closeConfigDrawer,
             saveConfig,
-            openFilterDrawer,
-            closeFilterDrawer,
+            openBodyFilterDrawer,           // 重命名
+            closeBodyFilterDrawer,          // 重命名
             loadFilter,
             saveFilter,
             addFilterRule,
             removeFilterRule,
+            openHeaderFilterDrawer,         // 新增
+            closeHeaderFilterDrawer,        // 新增
+            loadHeaderFilter,               // 新增
+            saveHeaderFilter,               // 新增
+            addBlockedHeader,               // 新增
+            removeBlockedHeader,            // 新增
+            applyHeaderPreset,              // 新增
             formatTimestamp,
             truncatePath,
             getStatusTagType,
+            formatHeaders,              // 新增
+            getFilteredHeaders,         // 新增
             showLogDetail,
             viewAllLogs,
             refreshAllLogs,

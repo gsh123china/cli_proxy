@@ -107,10 +107,15 @@
                             <div class="stat-value">{{ stats.configCount || 0 }}</div>
                             <div class="stat-hint">点击编辑配置</div>
                         </div>
-                        <div class="stat-card clickable" @click="openFilterDrawer">
-                            <h4>请求过滤</h4>
+                        <div class="stat-card clickable" @click="openBodyFilterDrawer">
+                            <h4>请求体过滤</h4>
                             <div class="stat-value">{{ stats.filterCount || 0 }}</div>
-                            <div class="stat-hint">点击编辑过滤</div>
+                            <div class="stat-hint">过滤请求内容</div>
+                        </div>
+                        <div class="stat-card clickable" @click="openHeaderFilterDrawer">
+                            <h4>请求头过滤</h4>
+                            <div class="stat-value">{{ stats.headerFilterCount || 0 }}</div>
+                            <div class="stat-hint">过滤隐私信息</div>
                         </div>
                         <div class="stat-card clickable usage-card" @click="openUsageDrawer">
                             <h4>Token 使用</h4>
@@ -691,14 +696,20 @@
             </div>
         </el-drawer>
 
-        <!-- 过滤器编辑抽屉 -->
-        <el-drawer 
-            v-model="filterDrawerVisible" 
-            title="请求过滤器编辑" 
+        <!-- Body Filter (请求体过滤器) 编辑抽屉 -->
+        <el-drawer
+            v-model="bodyFilterDrawerVisible"
+            title="请求体过滤器编辑"
             size="700px"
             class="filter-drawer">
-            
+
             <div class="config-content">
+                <div class="filter-info-box" style="background: #fff7e6; border-left: 4px solid #e6a23c; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                    <h4 style="margin: 0 0 10px 0; color: #e6a23c;">📋 功能说明</h4>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>作用：</strong>对发送给上游 API 的请求体内容进行文本替换/删除</p>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>日志：</strong>原始请求体会保留在日志中，过滤后的内容会发送给上游</p>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>常见场景：</strong>过滤敏感代码、路径、API key 等</p>
+                </div>
                 <div class="tab-panel active">
                     <div class="filter-editor">
                         <label>过滤规则配置:</label>
@@ -763,6 +774,90 @@
                             </el-button>
                         </div>
                     </div>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- Header Filter (请求头过滤器) 编辑抽屉 -->
+        <el-drawer
+            v-model="headerFilterDrawerVisible"
+            title="请求头过滤器编辑"
+            size="700px"
+            class="header-filter-drawer">
+
+            <div class="config-content">
+                <div class="filter-info-box" style="background: #f0f9ff; border-left: 4px solid #409eff; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                    <h4 style="margin: 0 0 10px 0; color: #409eff;">📋 功能说明</h4>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>作用：</strong>过滤转发给上游 API 的 HTTP Headers，保护隐私信息</p>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>日志：</strong>原始 Headers 会保留在日志中用于审计，但不会发送给上游</p>
+                    <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>常见场景：</strong>防止客户端 IP、协议等信息泄露给 Claude/Codex</p>
+                </div>
+
+                <div class="header-filter-toggle" style="margin: 20px 0;">
+                    <el-switch
+                        v-model="headerFilterConfig.enabled"
+                        active-text="启用 Header 过滤"
+                        inactive-text="禁用">
+                    </el-switch>
+                </div>
+
+                <div class="header-filter-list">
+                    <label style="font-weight: bold; display: block; margin-bottom: 10px;">黑名单 Headers:</label>
+                    <div class="header-list-container">
+                        <div v-for="(header, index) in headerFilterConfig.blocked_headers" :key="index"
+                             style="display: flex; gap: 10px; margin-bottom: 10px; align-items: center;">
+                            <el-input
+                                v-model="headerFilterConfig.blocked_headers[index]"
+                                placeholder="例如: x-forwarded-for"
+                                style="flex: 1">
+                            </el-input>
+                            <el-button
+                                @click="removeBlockedHeader(index)"
+                                type="danger"
+                                icon="el-icon-delete"
+                                circle
+                                size="small">
+                            </el-button>
+                        </div>
+                        <el-button
+                            @click="addBlockedHeader"
+                            type="success"
+                            size="small"
+                            icon="el-icon-plus"
+                            style="margin-top: 10px;">
+                            添加 Header
+                        </el-button>
+                    </div>
+                </div>
+
+                <div class="header-filter-presets" style="margin: 20px 0;">
+                    <label style="display: block; margin-bottom: 10px; font-weight: bold;">预设模板:</label>
+                    <el-button-group>
+                        <el-button size="small" @click="applyHeaderPreset('privacy')">
+                            隐私保护模式
+                        </el-button>
+                        <el-button size="small" @click="applyHeaderPreset('debug')">
+                            调试模式（全透传）
+                        </el-button>
+                        <el-button size="small" @click="applyHeaderPreset('default')">
+                            默认配置
+                        </el-button>
+                    </el-button-group>
+                </div>
+
+                <div class="editor-actions" style="margin-top: 20px;">
+                    <el-button
+                        type="primary"
+                        @click="saveHeaderFilter"
+                        :loading="headerFilterSaving"
+                        size="small">
+                        保存 Header 过滤配置
+                    </el-button>
+                    <el-button
+                        @click="loadHeaderFilter"
+                        size="small">
+                        重新加载
+                    </el-button>
                 </div>
             </div>
         </el-drawer>
@@ -864,6 +959,20 @@
                                         <span class="header-value-flat">{{ selectedLog.target_headers[key] }}</span>
                                     </div>
                                 </div>
+                            </div>
+
+                            <!-- 高亮显示被过滤的 Headers -->
+                            <div v-if="getFilteredHeaders(selectedLog).length > 0" style="margin-top: 15px; padding: 0 20px;">
+                                <el-alert
+                                    type="info"
+                                    :closable="false"
+                                    title="以下 Headers 已被过滤（未发送给上游）:">
+                                    <ul style="margin: 10px 0; padding-left: 20px;">
+                                        <li v-for="header in getFilteredHeaders(selectedLog)" :key="header" style="margin: 5px 0; font-family: monospace; font-size: 13px;">
+                                            {{ header }}
+                                        </li>
+                                    </ul>
+                                </el-alert>
                             </div>
                         </div>
                     </el-tab-pane>
