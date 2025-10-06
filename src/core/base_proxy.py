@@ -321,16 +321,28 @@ class BaseProxyService(ABC):
         """构建负载均衡默认配置"""
         return {
             'mode': 'active-first',
+            'options': {
+                # 是否在一轮候选全部失败后自动重置失败计数
+                'autoResetOnAllFailed': True,
+                # 冷却期，避免频繁重置导致风暴（秒）
+                'resetCooldownSeconds': 30,
+                # UI 通知开关（前端可读取）
+                'notifyEnabled': True,
+                'failureThreshold': 3,
+            },
             'services': {
                 'claude': {
                     'failureThreshold': 3,
                     'currentFailures': {},
-                    'excludedConfigs': []
+                    'excludedConfigs': [],
+                    # 上次自动重置时间戳（秒）
+                    'lastResetAt': 0,
                 },
                 'codex': {
                     'failureThreshold': 3,
                     'currentFailures': {},
-                    'excludedConfigs': []
+                    'excludedConfigs': [],
+                    'lastResetAt': 0,
                 }
             }
         }
@@ -342,6 +354,14 @@ class BaseProxyService(ABC):
         service_section.setdefault('failureThreshold', 3)
         service_section.setdefault('currentFailures', {})
         service_section.setdefault('excludedConfigs', [])
+        service_section.setdefault('lastResetAt', 0)
+        # 兼容老版本缺失 options
+        config.setdefault('options', {})
+        options = config['options']
+        options.setdefault('autoResetOnAllFailed', True)
+        options.setdefault('resetCooldownSeconds', 30)
+        options.setdefault('notifyEnabled', True)
+        options.setdefault('failureThreshold', service_section.get('failureThreshold', 3))
 
     def _load_lb_config(self) -> dict:
         """加载负载均衡配置"""
@@ -524,7 +544,7 @@ class BaseProxyService(ABC):
         excluded = service_section.setdefault('excludedConfigs', [])
 
         changed = False
-        is_success = status_code is not None and 200 <= int(status_code) < 300
+        is_success = status_code is not None and self._is_success_status(int(status_code))
 
         if is_success:
             if failures.get(config_name, 0) != 0:
@@ -544,6 +564,58 @@ class BaseProxyService(ABC):
 
         if changed:
             self._persist_lb_config()
+
+    def _is_success_status(self, sc: int) -> bool:
+        """定义成功的HTTP状态：2xx + 白名单3xx(304/307)"""
+        return (200 <= sc < 300) or sc in {304, 307}
+
+    def _get_candidate_order(self, configs: Dict[str, Dict[str, Any]]) -> list:
+        """按权重返回健康候选列表；若无健康项，返回兜底单项列表"""
+        if not configs:
+            return []
+
+        self._ensure_lb_config_current()
+        service_section = self.lb_config.get('services', {}).get(self.service_name, {})
+        threshold = service_section.get('failureThreshold', 3)
+        failures = service_section.get('currentFailures', {})
+        excluded = set(service_section.get('excludedConfigs', []))
+
+        sorted_configs = sorted(
+            configs.items(),
+            key=lambda item: (-float(item[1].get('weight', 0) or 0), item[0])
+        )
+
+        healthy = [name for name, _ in sorted_configs if failures.get(name, 0) < threshold and name not in excluded]
+        if healthy:
+            return healthy
+
+        # 兜底：当无健康候选时，至少尝试一个
+        active_config = self.config_manager.active_config
+        if active_config in configs:
+            return [active_config]
+        return [sorted_configs[0][0]]
+
+    def _reset_lb_service_failures(self) -> bool:
+        """重置当前服务的失败计数并记录时间戳；返回是否执行了重置（受冷却期限制）"""
+        self._ensure_lb_config_current()
+        options = self.lb_config.setdefault('options', {})
+        cooldown = int(options.get('resetCooldownSeconds', 30) or 30)
+
+        service_section = self.lb_config['services'][self.service_name]
+        last_reset = float(service_section.get('lastResetAt', 0) or 0)
+        now = time.time()
+        if last_reset and (now - last_reset) < cooldown:
+            return False
+
+        service_section['currentFailures'] = {}
+        service_section['excludedConfigs'] = []
+        service_section['lastResetAt'] = now
+        self._persist_lb_config()
+        return True
+
+    def _get_lb_options(self) -> dict:
+        self._ensure_lb_config_current()
+        return self.lb_config.get('options', {})
 
     def build_target_param(self, path: str, request: Request, body: bytes) -> Tuple[str, Dict, bytes, Optional[str]]:
         """
@@ -654,26 +726,12 @@ class BaseProxyService(ABC):
         filtered_body: Optional[bytes] = None
         target_url: Optional[str] = None
 
-        try:
-            target_url, target_headers, target_body, active_config_name = self.build_target_param(path, request, original_body)
+        # ---- 新的多候选重试流程（仅权重模式） ----
+        # 预处理：模型/配置路由
+        self._ensure_routing_config_current()
+        modified_body, config_override = self._apply_model_routing(original_body)
 
-            # 发送请求开始事件
-            await self.realtime_hub.request_started(
-                request_id=request_id,
-                method=request.method,
-                path=path,
-                channel=active_config_name or "unknown",
-                headers=target_headers,
-                target_url=target_url
-            )
-
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
-
-        # 应用请求过滤器，放到线程池避免阻塞事件循环
-        filtered_body = await asyncio.to_thread(self.apply_request_filter, target_body)
-
-        # 检测是否需要流式传输
+        # 请求是否流式
         headers_lower = {k.lower(): v for k, v in original_headers.items()}
         x_stainless_helper_method = headers_lower.get('x-stainless-helper-method', '').lower()
         content_type = headers_lower.get('content-type', '').lower()
@@ -686,148 +744,322 @@ class BaseProxyService(ABC):
             "stream" in x_stainless_helper_method
         )
 
-        try:
-            request_out = self.client.build_request(
-                method=request.method,
-                url=target_url,
-                headers=target_headers,
-                content=filtered_body if filtered_body else None,
-            )
-            response = await self.client.send(request_out, stream=is_stream)
+        # 构建候选序列
+        configs = self.config_manager.configs
+        lb_mode = self.lb_config.get('mode', 'active-first')
+        auto_reset_enabled = bool(self._get_lb_options().get('autoResetOnAllFailed', True))
 
-            status_code = response.status_code
-            lb_result_recorded = False
+        def _build_target_param_for_config(config_name: str):
+            cfg = self.config_manager.configs.get(config_name)
+            if not cfg:
+                raise ValueError(f"未找到配置: {config_name}")
 
-            if not (200 <= status_code < 300):
-                await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
-                lb_result_recorded = True
+            base_url = cfg['base_url'].rstrip('/')
+            normalized_path = path.lstrip('/')
+            url = f"{base_url}/{normalized_path}" if normalized_path else base_url
+            raw_query = request.url.query
+            if raw_query:
+                url = f"{url}?{raw_query}"
 
-            # 构造返回头，移除跳跃性头信息
-            excluded_response_headers = {'connection', 'transfer-encoding'}
-            response_headers = {
-                k: v for k, v in response.headers.items()
-                if k.lower() not in excluded_response_headers
-            }
-
-            collected = bytearray()
-            total_response_bytes = 0
-            response_truncated = False
-            first_chunk = True
-
-            async def iterator():
-                nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
-                try:
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-
-                        current_duration = int((time.time() - start_time) * 1000)
-
-                        # 首次接收数据时标记为流式状态
-                        if first_chunk:
-                            await self.realtime_hub.request_streaming(request_id, current_duration)
-                            first_chunk = False
-
-                        # 尝试解码为文本发送实时更新
-                        try:
-                            chunk_text = chunk.decode('utf-8', errors='ignore')
-                            if chunk_text.strip():  # 只发送非空chunk
-                                await self.realtime_hub.response_chunk(
-                                    request_id, chunk_text, current_duration
-                                )
-                        except Exception:
-                            pass  # 忽略解码失败
-
-                        total_response_bytes += len(chunk)
-                        if len(collected) < self.max_logged_response_bytes:
-                            remaining = self.max_logged_response_bytes - len(collected)
-                            collected.extend(chunk[:remaining])
-                            if len(chunk) > remaining:
-                                response_truncated = True
-                        else:
-                            response_truncated = True
-                        yield chunk
-                finally:
-                    final_duration = int((time.time() - start_time) * 1000)
-
-                    # 发送请求完成事件
-                    await self.realtime_hub.request_completed(
-                        request_id=request_id,
-                        status_code=status_code,
-                        duration_ms=final_duration,
-                        success=200 <= status_code < 400
-                    )
-
-                    await response.aclose()
-
-                    # 原有日志记录逻辑
-                    response_content = bytes(collected) if collected else None
-                    await self.log_request(
-                        method=request.method,
-                        path=path,
-                        status_code=status_code,
-                        duration_ms=final_duration,
-                        target_headers=target_headers,
-                        filtered_body=filtered_body,
-                        original_headers=original_headers,
-                        original_body=original_body,
-                        response_content=response_content,
-                        channel=active_config_name,
-                        response_truncated=response_truncated,
-                        total_response_bytes=total_response_bytes,
-                        target_url=target_url,
-                    )
-
-                    if not lb_result_recorded:
-                        await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
-                        lb_result_recorded = True
-
-            return StreamingResponse(
-                iterator(),
-                status_code=status_code,
-                headers=response_headers
-            )
-        except httpx.RequestError as exc:
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            if isinstance(exc, httpx.ConnectTimeout):
-                error_msg = "连接超时"
-            elif isinstance(exc, httpx.ReadTimeout):
-                error_msg = "响应读取超时"
-            elif isinstance(exc, httpx.ConnectError):
-                error_msg = "连接错误"
-            elif isinstance(exc, httpx.HTTPStatusError):
-                error_msg = "上游返回错误状态"
+            # Header 过滤
+            original_headers_dict = dict(request.headers)
+            if self.header_filter:
+                self.header_filter.reload_config()
+                filtered_headers_dict = self.header_filter.filter_headers(original_headers_dict)
             else:
-                error_msg = "请求失败"
+                filtered_headers_dict = original_headers_dict
 
-            response_data = {"error": error_msg, "detail": str(exc)}
-            status_code = 500
+            excluded_headers = {'authorization', 'host', 'content-length'}
+            headers = {k: v for k, v in filtered_headers_dict.items() if k.lower() not in excluded_headers}
+            headers['host'] = urlsplit(url).netloc
+            headers.setdefault('connection', 'keep-alive')
+            if cfg.get('api_key'):
+                headers['x-api-key'] = cfg['api_key']
+            if cfg.get('auth_token'):
+                headers['authorization'] = f'Bearer {cfg["auth_token"]}'
+            return url, headers
 
-            # 发送错误事件
-            await self.realtime_hub.request_completed(
-                request_id=request_id,
-                status_code=status_code,
-                duration_ms=duration_ms,
-                success=False
+        async def _try_once(config_name: str):
+            nonlocal filtered_body
+            # 为该尝试生成 target
+            try:
+                url, headers = _build_target_param_for_config(config_name)
+            except Exception as e:
+                return False, {"error": str(e)}, None, False, None, None
+
+            # 首次发送 started 事件使用第一候选
+            if not started_event_sent[0]:
+                await self.realtime_hub.request_started(
+                    request_id=request_id,
+                    method=request.method,
+                    path=path,
+                    channel=config_name or "unknown",
+                    headers=headers,
+                    target_url=url
+                )
+                started_event_sent[0] = True
+
+            # 过滤 Body（一次性缓存）
+            if filtered_body is None:
+                filtered_body = await asyncio.to_thread(self.apply_request_filter, modified_body)
+
+            try:
+                request_out = self.client.build_request(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    content=filtered_body if filtered_body else None,
+                )
+                response = await self.client.send(request_out, stream=is_stream)
+                sc = response.status_code
+                if not self._is_success_status(sc):
+                    await asyncio.to_thread(self._record_lb_result, config_name, sc)
+                    await response.aclose()
+                    return False, {"error": f"上游返回非2xx: {sc}"}, sc, False, url, headers
+
+                # 2xx：返回可流式的 StreamingResponse，并在 iterator 中记录日志与成功
+                excluded_response_headers = {'connection', 'transfer-encoding'}
+                response_headers = {k: v for k, v in response.headers.items() if k.lower() not in excluded_response_headers}
+
+                collected = bytearray()
+                total_response_bytes = 0
+                response_truncated = False
+                first_chunk = True
+                lb_result_recorded = False
+
+                async def iterator():
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            if not chunk:
+                                continue
+                            current_duration = int((time.time() - start_time) * 1000)
+                            if first_chunk:
+                                await self.realtime_hub.request_streaming(request_id, current_duration)
+                                first_chunk = False
+                            try:
+                                chunk_text = chunk.decode('utf-8', errors='ignore')
+                                if chunk_text.strip():
+                                    await self.realtime_hub.response_chunk(request_id, chunk_text, current_duration)
+                            except Exception:
+                                pass
+                            total_response_bytes += len(chunk)
+                            if len(collected) < self.max_logged_response_bytes:
+                                remaining = self.max_logged_response_bytes - len(collected)
+                                collected.extend(chunk[:remaining])
+                                if len(chunk) > remaining:
+                                    response_truncated = True
+                            else:
+                                response_truncated = True
+                            yield chunk
+                    finally:
+                        final_duration = int((time.time() - start_time) * 1000)
+                        await self.realtime_hub.request_completed(
+                            request_id=request_id,
+                            status_code=sc,
+                            duration_ms=final_duration,
+                            success=self._is_success_status(sc)
+                        )
+                        await response.aclose()
+                        response_content = bytes(collected) if collected else None
+                        await self.log_request(
+                            method=request.method,
+                            path=path,
+                            status_code=sc,
+                            duration_ms=final_duration,
+                            target_headers=headers,
+                            filtered_body=filtered_body,
+                            original_headers=original_headers,
+                            original_body=original_body,
+                            response_content=response_content,
+                            channel=config_name,
+                            response_truncated=response_truncated,
+                            total_response_bytes=total_response_bytes,
+                            target_url=url,
+                        )
+                        if not lb_result_recorded:
+                            await asyncio.to_thread(self._record_lb_result, config_name, sc)
+                            lb_result_recorded = True
+
+                streaming_resp = StreamingResponse(iterator(), status_code=sc, headers=response_headers)
+                return True, streaming_resp, sc, False, url, headers
+
+            except httpx.RequestError as exc:
+                # 连接/超时等错误：可切换
+                await asyncio.to_thread(self._record_lb_result, config_name, None)
+                err = {
+                    "error": "请求失败",
+                    "detail": str(exc)
+                }
+                return False, err, None, False, url, headers
+
+        # 候选序列
+        if config_override:
+            candidates_round1 = [config_override]
+        elif lb_mode == 'weight-based':
+            candidates_round1 = self._get_candidate_order(configs)
+        else:
+            # active-first: 维持原有行为
+            try:
+                target_url, target_headers, target_body, active_config_name = self.build_target_param(path, request, original_body)
+                await self.realtime_hub.request_started(
+                    request_id=request_id,
+                    method=request.method,
+                    path=path,
+                    channel=active_config_name or "unknown",
+                    headers=target_headers,
+                    target_url=target_url
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=500)
+            # 回退到原有单次执行路径
+            filtered_body = await asyncio.to_thread(self.apply_request_filter, target_body)
+            try:
+                request_out = self.client.build_request(
+                    method=request.method,
+                    url=target_url,
+                    headers=target_headers,
+                    content=filtered_body if filtered_body else None,
+                )
+                response = await self.client.send(request_out, stream=is_stream)
+                status_code = response.status_code
+                lb_result_recorded = False
+                if not self._is_success_status(status_code):
+                    await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                    lb_result_recorded = True
+                excluded_response_headers = {'connection', 'transfer-encoding'}
+                response_headers = {k: v for k, v in response.headers.items() if k.lower() not in excluded_response_headers}
+                collected = bytearray(); total_response_bytes = 0; response_truncated = False; first_chunk = True
+                async def iterator():
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            if not chunk: continue
+                            current_duration = int((time.time() - start_time) * 1000)
+                            if first_chunk:
+                                await self.realtime_hub.request_streaming(request_id, current_duration)
+                                first_chunk = False
+                            try:
+                                chunk_text = chunk.decode('utf-8', errors='ignore')
+                                if chunk_text.strip():
+                                    await self.realtime_hub.response_chunk(request_id, chunk_text, current_duration)
+                            except Exception:
+                                pass
+                            total_response_bytes += len(chunk)
+                            if len(collected) < self.max_logged_response_bytes:
+                                remaining = self.max_logged_response_bytes - len(collected)
+                                collected.extend(chunk[:remaining])
+                                if len(chunk) > remaining: response_truncated = True
+                            else:
+                                response_truncated = True
+                            yield chunk
+                    finally:
+                        final_duration = int((time.time() - start_time) * 1000)
+                        await self.realtime_hub.request_completed(request_id=request_id, status_code=status_code, duration_ms=final_duration, success=self._is_success_status(status_code))
+                        await response.aclose()
+                        response_content = bytes(collected) if collected else None
+                        await self.log_request(method=request.method, path=path, status_code=status_code, duration_ms=final_duration, target_headers=target_headers, filtered_body=filtered_body, original_headers=original_headers, original_body=original_body, response_content=response_content, channel=active_config_name, response_truncated=response_truncated, total_response_bytes=total_response_bytes, target_url=target_url)
+                        if not lb_result_recorded:
+                            await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                            lb_result_recorded = True
+                return StreamingResponse(iterator(), status_code=status_code, headers=response_headers)
+            except httpx.RequestError as exc:
+                duration_ms = int((time.time() - start_time) * 1000)
+                if isinstance(exc, httpx.ConnectTimeout): error_msg = "连接超时"
+                elif isinstance(exc, httpx.ReadTimeout): error_msg = "响应读取超时"
+                elif isinstance(exc, httpx.ConnectError): error_msg = "连接错误"
+                elif isinstance(exc, httpx.HTTPStatusError): error_msg = "上游返回错误状态"
+                else: error_msg = "请求失败"
+                response_data = {"error": error_msg, "detail": str(exc)}
+                status_code = 500
+                await self.realtime_hub.request_completed(request_id=request_id, status_code=status_code, duration_ms=duration_ms, success=False)
+                await self.log_request(method=request.method, path=path, status_code=status_code, duration_ms=duration_ms, target_headers=target_headers, filtered_body=filtered_body, original_headers=original_headers, original_body=original_body, channel=active_config_name, target_url=target_url)
+                await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                return JSONResponse(response_data, status_code=status_code)
+
+        # weight-based 多候选：两轮（第二轮可重置）
+        candidates_history_error = None
+        attempt_counter = 0
+        previous_candidate = None
+        last_status_code = None
+        # 用于首次 started 事件的标记
+        started_event_sent = [False]
+
+        async def run_round(candidates: list, round_index: int):
+            nonlocal previous_candidate, attempt_counter, candidates_history_error, last_status_code
+            service_section = self.lb_config['services'][self.service_name]
+            threshold = service_section.get('failureThreshold', 3)
+            for cand in candidates:
+                attempt_counter += 1
+                if previous_candidate and previous_candidate != cand:
+                    failures = service_section.get('currentFailures', {}).get(previous_candidate, 0)
+                    reason = 'http_non2xx' if (last_status_code and not (200 <= int(last_status_code) < 300)) else 'request_error'
+                    await self.realtime_hub.lb_switch(
+                        request_id,
+                        from_channel=previous_candidate,
+                        to_channel=cand,
+                        reason=reason,
+                        failures=failures,
+                        threshold=threshold,
+                        attempt=attempt_counter,
+                        path=path,
+                    )
+                ok, result, sc, bytes_sent, url, headers = await _try_once(cand)
+                previous_candidate = cand
+                last_status_code = sc
+                if ok:
+                    # 直接返回成功的 StreamingResponse
+                    return True, result
+                else:
+                    candidates_history_error = result
+                    # 未开始向客户端写入，继续下一候选
+                    continue
+            return False, candidates_history_error
+
+        # 第一轮
+        ok1, res1 = await run_round(candidates_round1, 1)
+        if ok1:
+            return res1
+
+        # 第一轮全部失败：根据选项判断是否自动重置并进行第二轮
+        if auto_reset_enabled and self._reset_lb_service_failures():
+            # 广播重置事件
+            svc_section = self.lb_config['services'][self.service_name]
+            await self.realtime_hub.lb_reset(
+                request_id,
+                reason='last_candidate_failed',
+                total_configs=len(configs),
+                threshold=svc_section.get('failureThreshold', 3)
             )
+            # 第二轮：重置后等价于所有候选健康，直接按权重排序
+            sorted_all = sorted(configs.items(), key=lambda item: (-float(item[1].get('weight', 0) or 0), item[0]))
+            candidates_round2 = [name for name, _ in sorted_all]
+            ok2, res2 = await run_round(candidates_round2, 2)
+            if ok2:
+                return res2
 
-            await self.log_request(
-                method=request.method,
-                path=path,
-                status_code=status_code,
-                duration_ms=duration_ms,
-                target_headers=target_headers,
-                filtered_body=filtered_body,
-                original_headers=original_headers,
-                original_body=original_body,
-                channel=active_config_name,
-                target_url=target_url
-            )
-
-            await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
-
-            return JSONResponse(response_data, status_code=status_code)
+        # 未开启自动重置 或 第二轮仍失败 → 返回最后错误
+        duration_ms = int((time.time() - start_time) * 1000)
+        await self.realtime_hub.request_completed(
+            request_id=request_id,
+            status_code=500 if (last_status_code is None) else last_status_code,
+            duration_ms=duration_ms,
+            success=False
+        )
+        # 记录一次失败日志（不含响应体）
+        await self.log_request(
+            method=request.method,
+            path=path,
+            status_code=500 if (last_status_code is None) else last_status_code,
+            duration_ms=duration_ms,
+            target_headers=None,
+            filtered_body=None,
+            original_headers=original_headers,
+            original_body=original_body,
+            channel=previous_candidate,
+            target_url=None
+        )
+        return JSONResponse(candidates_history_error or {"error": "所有上游均失败"}, status_code=500 if (last_status_code is None) else int(last_status_code))
 
     def run_app(self):
         """启动代理服务"""

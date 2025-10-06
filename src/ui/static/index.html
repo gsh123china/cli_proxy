@@ -222,6 +222,23 @@
                     </div>
 
                     <div class="loadbalance-details" v-if="isLoadbalanceWeightMode" v-loading="loadbalanceLoading">
+                        <div class="lb-options-bar">
+                            <div class="lb-options-title">全局控制</div>
+                            <div class="lb-options-items">
+                                <el-switch v-model="loadbalanceOptions.notifyEnabled" @change="saveLoadbalanceConfig(false)" active-text="通知开关"></el-switch>
+                                <el-switch v-model="loadbalanceOptions.autoResetOnAllFailed" @change="saveLoadbalanceConfig(false)" active-text="自动重置开关"></el-switch>
+                                <div class="lb-options-input">
+                                    <span class="lb-options-label">失败阈值</span>
+                                    <el-input-number v-model.number="loadbalanceOptions.failureThreshold" :min="1" :max="10" @change="updateGlobalFailureThreshold" size="small"></el-input-number>
+                                    <span class="lb-options-unit">次</span>
+                                </div>
+                                <div class="lb-options-input">
+                                    <span class="lb-options-label">重置冷却</span>
+                                    <el-input-number v-model="loadbalanceOptions.resetCooldownSeconds" :min="5" :max="600" @change="saveLoadbalanceConfig(false)" size="small"></el-input-number>
+                                    <span class="lb-options-unit">秒</span>
+                                </div>
+                            </div>
+                        </div>
                         <div class="lb-service-block" v-for="service in ['claude', 'codex']" :key="service">
                             <div class="lb-block-header">
                                 <h4>{{ service === 'claude' ? 'Claude' : 'Codex' }} 转发顺序</h4>

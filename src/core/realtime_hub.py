@@ -211,6 +211,56 @@ class RealTimeRequestHub:
         except Exception as e:
             self.logger.error(f"标记请求完成失败: {e}")
 
+    async def lb_switch(
+        self,
+        request_id: str,
+        from_channel: str,
+        to_channel: str,
+        reason: str,
+        failures: int,
+        threshold: int,
+        attempt: int,
+        path: str,
+        target_from: Optional[str] = None,
+        target_to: Optional[str] = None,
+    ):
+        """在同一请求内从一个上游切换到另一个上游时广播通知"""
+        try:
+            await self.broadcast_event(
+                "lb_switch",
+                request_id,
+                from_channel=from_channel,
+                to_channel=to_channel,
+                reason=reason,
+                failures=failures,
+                threshold=threshold,
+                attempt=attempt,
+                path=path,
+                target_from=target_from,
+                target_to=target_to,
+            )
+        except Exception as e:
+            self.logger.error(f"广播 lb_switch 事件失败: {e}")
+
+    async def lb_reset(
+        self,
+        request_id: str,
+        reason: str,
+        total_configs: int,
+        threshold: int,
+    ):
+        """在一轮候选全部失败后，重置失败计数并从头重试时广播通知"""
+        try:
+            await self.broadcast_event(
+                "lb_reset",
+                request_id,
+                reason=reason,
+                total_configs=total_configs,
+                threshold=threshold,
+            )
+        except Exception as e:
+            self.logger.error(f"广播 lb_reset 事件失败: {e}")
+
     async def _delayed_cleanup(self, request_id: str, delay_seconds: int):
         """延迟清理请求"""
         try:

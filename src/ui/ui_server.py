@@ -1099,6 +1099,12 @@ def get_loadbalance_config():
 
         default_config = {
             'mode': 'active-first',
+            'options': {
+                'autoResetOnAllFailed': True,
+                'resetCooldownSeconds': 30,
+                'notifyEnabled': True,
+                'failureThreshold': 3,
+            },
             'services': {
                 'claude': default_section(),
                 'codex': default_section()
@@ -1113,6 +1119,12 @@ def get_loadbalance_config():
 
         config = {
             'mode': raw_config.get('mode', 'active-first'),
+            'options': {
+                'autoResetOnAllFailed': bool(raw_config.get('options', {}).get('autoResetOnAllFailed', True)),
+                'notifyEnabled': bool(raw_config.get('options', {}).get('notifyEnabled', True)),
+                'resetCooldownSeconds': int(raw_config.get('options', {}).get('resetCooldownSeconds', 30) or 30),
+                'failureThreshold': int(raw_config.get('options', {}).get('failureThreshold', 3) or 3),
+            },
             'services': {
                 'claude': default_section(),
                 'codex': default_section()
@@ -1151,6 +1163,11 @@ def get_loadbalance_config():
                 'excludedConfigs': normalized_excluded,
             }
 
+        # 若存在全局阈值，应用到各服务，保持前端展示一致
+        options_threshold = config['options']['failureThreshold']
+        for service in ['claude', 'codex']:
+            config['services'][service]['failureThreshold'] = options_threshold
+
         return jsonify({'config': config})
 
     except Exception as e:
@@ -1172,8 +1189,28 @@ def save_loadbalance_config():
         services = data.get('services', {})
         normalized = {
             'mode': mode,
+            'options': {
+                'autoResetOnAllFailed': bool(data.get('options', {}).get('autoResetOnAllFailed', True)),
+                'notifyEnabled': bool(data.get('options', {}).get('notifyEnabled', True)),
+            },
             'services': {}
         }
+
+        # 限制冷却秒数为正整数
+        try:
+            cooldown = int(data.get('options', {}).get('resetCooldownSeconds', 30) or 30)
+            if cooldown <= 0:
+                cooldown = 30
+        except Exception:
+            cooldown = 30
+        normalized['options']['resetCooldownSeconds'] = cooldown
+        try:
+            failure_threshold = int(data.get('options', {}).get('failureThreshold', 3) or 3)
+            if failure_threshold <= 0:
+                failure_threshold = 1
+        except Exception:
+            failure_threshold = 3
+        normalized['options']['failureThreshold'] = failure_threshold
 
         for service in ['claude', 'codex']:
             section = services.get(service, {})
@@ -1211,8 +1248,31 @@ def save_loadbalance_config():
 
         lb_config_file = DATA_DIR / 'lb_config.json'
 
+        # 合并写入，保留内部使用的 lastResetAt 等字段
+        to_write = {}
+        if lb_config_file.exists():
+            try:
+                with open(lb_config_file, 'r', encoding='utf-8') as f:
+                    to_write = json.load(f)
+            except Exception:
+                to_write = {}
+        # 覆盖 mode/options
+        to_write['mode'] = normalized['mode']
+        to_write['options'] = normalized['options']
+        # 覆盖/规范 services 公开字段
+        services_out = to_write.setdefault('services', {})
+        for svc in ['claude', 'codex']:
+            sec_out = services_out.setdefault(svc, {})
+            sec_in = normalized['services'][svc]
+            sec_out['failureThreshold'] = normalized['options']['failureThreshold']
+            sec_out['currentFailures'] = sec_in['currentFailures']
+            sec_out['excludedConfigs'] = sec_in['excludedConfigs']
+            # 保留 lastResetAt（如果有）
+            if 'lastResetAt' not in sec_out:
+                sec_out['lastResetAt'] = 0
+
         with open(lb_config_file, 'w', encoding='utf-8') as f:
-            json.dump(normalized, f, ensure_ascii=False, indent=2)
+            json.dump(to_write, f, ensure_ascii=False, indent=2)
 
         return jsonify({'success': True, 'message': '负载均衡配置保存成功'})
 
@@ -1248,6 +1308,8 @@ def reset_loadbalance_failures():
 
         current_failures = service_config.setdefault('currentFailures', {})
         excluded_configs = service_config.setdefault('excludedConfigs', [])
+        # 记录 lastResetAt 以与自动重置的冷却逻辑保持一致
+        import time as _time
 
         if config_name:
             key = str(config_name)
@@ -1255,10 +1317,13 @@ def reset_loadbalance_failures():
                 current_failures[key] = 0
             if key in excluded_configs:
                 excluded_configs.remove(key)
+            # 单个配置重置也刷新整体 lastResetAt，避免立刻触发自动重置
+            service_config['lastResetAt'] = _time.time()
             message = f'已重置 {service} 服务的 {key} 配置失败计数'
         else:
             service_config['currentFailures'] = {}
             service_config['excludedConfigs'] = []
+            service_config['lastResetAt'] = _time.time()
             message = f'已重置 {service} 服务的所有失败计数'
 
         with open(lb_config_file, 'w', encoding='utf-8') as f:

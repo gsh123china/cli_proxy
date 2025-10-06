@@ -185,6 +185,12 @@ const app = createApp({
                 }
             }
         });
+        const loadbalanceOptions = reactive({
+            autoResetOnAllFailed: true,
+            notifyEnabled: true,
+            resetCooldownSeconds: 30,
+            failureThreshold: 3,
+        });
         const loadbalanceSaving = ref(false);
         const loadbalanceLoading = ref(false);
         const resettingFailures = reactive({ claude: false, codex: false });
@@ -795,6 +801,12 @@ const app = createApp({
         const normalizeLoadbalanceConfig = (payload = {}) => {
             const normalized = {
                 mode: payload.mode === 'weight-based' ? 'weight-based' : 'active-first',
+                options: {
+                    autoResetOnAllFailed: !!(payload.options?.autoResetOnAllFailed ?? true),
+                    notifyEnabled: !!(payload.options?.notifyEnabled ?? true),
+                    resetCooldownSeconds: Number(payload.options?.resetCooldownSeconds ?? 30) || 30,
+                    failureThreshold: Number(payload.options?.failureThreshold ?? 3) || 3,
+                },
                 services: {
                     claude: {
                         failureThreshold: 3,
@@ -831,6 +843,10 @@ const app = createApp({
 
         const applyLoadbalanceConfig = (normalized) => {
             loadbalanceConfig.mode = normalized.mode;
+            loadbalanceOptions.autoResetOnAllFailed = !!normalized.options?.autoResetOnAllFailed;
+            loadbalanceOptions.notifyEnabled = !!normalized.options?.notifyEnabled;
+            loadbalanceOptions.resetCooldownSeconds = Number(normalized.options?.resetCooldownSeconds || 30);
+            loadbalanceOptions.failureThreshold = Number(normalized.options?.failureThreshold || normalized.services?.claude?.failureThreshold || 3);
             ['claude', 'codex'].forEach(service => {
                 const svc = normalized.services[service];
                 loadbalanceConfig.services[service].failureThreshold = svc.failureThreshold;
@@ -859,11 +875,30 @@ const app = createApp({
 
             return {
                 mode: loadbalanceConfig.mode,
+                options: {
+                    autoResetOnAllFailed: !!loadbalanceOptions.autoResetOnAllFailed,
+                    notifyEnabled: !!loadbalanceOptions.notifyEnabled,
+                    resetCooldownSeconds: Number(loadbalanceOptions.resetCooldownSeconds || 30),
+                    failureThreshold: Number(loadbalanceOptions.failureThreshold || 3),
+                },
                 services: {
                     claude: buildServiceSection('claude'),
                     codex: buildServiceSection('codex')
                 }
             };
+        };
+
+        const updateGlobalFailureThreshold = (value) => {
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric)) {
+                return;
+            }
+            const threshold = Math.min(Math.max(Math.trunc(numeric), 1), 10);
+            loadbalanceOptions.failureThreshold = threshold;
+            ['claude', 'codex'].forEach(service => {
+                loadbalanceConfig.services[service].failureThreshold = threshold;
+            });
+            saveLoadbalanceConfig(false);
         };
 
         const loadLoadbalanceConfig = async () => {
@@ -1955,6 +1990,31 @@ const app = createApp({
         const handleRealTimeEvent = (event) => {
             try {
                 switch (event.type) {
+                    case 'lb_switch':
+                        if (loadbalanceOptions.notifyEnabled) {
+                            const msg = `服务 [${event.service}] 上游切换：${event.from_channel} → ${event.to_channel}（失败 ${event.failures}/${event.threshold}，尝试 #${event.attempt}）`;
+                            ElMessage.warning({ message: msg, duration: 3000, showClose: true });
+                        }
+                        // 将实时请求列表中该请求的 channel 更新为新的上游，便于列表直观看到最终上游
+                        {
+                            const req = realtimeRequests.value.find(r => r.request_id === event.request_id);
+                            if (req) {
+                                req.channel = event.to_channel || req.channel;
+                            }
+                        }
+                        if (isLoadbalanceWeightMode.value) {
+                            loadLoadbalanceConfig().catch(() => {});
+                        }
+                        break;
+                    case 'lb_reset':
+                        if (loadbalanceOptions.notifyEnabled) {
+                            const msg = `服务 [${event.service}] 一轮候选均失败，已重置失败计数并重试（共 ${event.total_configs} 个，阈值 ${event.threshold}）`;
+                            ElMessage.info({ message: msg, duration: 3000, showClose: true });
+                        }
+                        if (isLoadbalanceWeightMode.value) {
+                            loadLoadbalanceConfig().catch(() => {});
+                        }
+                        break;
                     case 'connection':
                         connectionStatus[event.service] = event.status === 'connected';
                         if (event.status === 'connected') {
@@ -2245,6 +2305,8 @@ const app = createApp({
             // 实时请求相关
             realtimeRequests,
             realtimeDetailVisible,
+            loadbalanceOptions,
+            updateGlobalFailureThreshold,
             selectedRealtimeRequest,
             connectionStatus,
             formatRealtimeTime,
@@ -2282,6 +2344,7 @@ const app = createApp({
             isLoadbalanceWeightMode,
             weightedTargets,
             selectLoadbalanceMode,
+            saveLoadbalanceConfig,
             resetLoadbalanceFailures,
             resettingFailures
         };

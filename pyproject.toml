@@ -12,16 +12,17 @@ authors = [
 license = "MIT"
 requires-python = ">=3.7"
 dependencies = [
-    "flask>=2.0.0",
-    "fastapi>=0.110.0",
-    "httpx>=0.27.0",
-    "requests>=2.25.0",
-    "aiohttp>=3.8.0",
+    # 收紧上限，减少 pip 解析回溯时间
+    "flask>=2.0,<3",
+    "fastapi>=0.110,<0.116",
+    "httpx>=0.27,<0.28",
+    "requests>=2.25,<3",
+    "aiohttp>=3.12,<3.13",
     "gunicorn>=20.0.0; sys_platform != 'win32'",
     "waitress>=2.1.0; sys_platform == 'win32'",
-    "psutil>=5.8.0",
-    "urllib3>=2.0.0",
-    "uvicorn[standard]>=0.30.0"
+    "psutil>=5.8,<7",
+    "urllib3>=2.0,<3",
+    "uvicorn[standard]>=0.30,<0.31"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
