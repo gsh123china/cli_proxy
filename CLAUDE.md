@@ -154,6 +154,8 @@ clp restart
 deactivate
 ```
 
+- 在运行 `pytest -q` 或其他测试命令前，务必先执行 `source clp-env/bin/activate` 激活虚拟环境。
+
 ### 安装
 ```bash
 # 方式 1：从源代码安装（开发模式）

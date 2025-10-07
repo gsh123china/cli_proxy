@@ -20,6 +20,7 @@
 ## 测试指南
 - 推荐 `pytest`：`tests/unit/`（工具与过滤器）、`tests/integration/`（FastAPI 代理路径，`httpx.AsyncClient`）。
 - 文件命名 `test_*.py`，运行 `pytest -q`；避免固定端口，优先 ASGI 测试客户端与临时事件循环。
+- 运行 `pytest -q`、`pytest tests/...` 等命令前，请先执行 `source clp-env/bin/activate` 激活虚拟环境。
 - 建议覆盖率 ≥70%（可用 `pytest-cov`）。测试写入请隔离 `~/.clp` 到临时目录。
 
 ## 提交与 PR 规范
