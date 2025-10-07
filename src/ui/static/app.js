@@ -223,6 +223,11 @@ const app = createApp({
         };
 
         const metricKeys = ['input', 'cached_create', 'cached_read', 'output', 'reasoning', 'total'];
+        const tokenServiceKeys = ['claude', 'codex'];
+        const tokenServiceLabels = {
+            claude: 'Claude CLI',
+            codex: 'Codex CLI'
+        };
         const createEmptyMetrics = () => ({
             input: 0,
             cached_create: 0,
@@ -658,27 +663,27 @@ const app = createApp({
                 const tokens = {};
                 tokenEntries.forEach(([tokenName, tokenPayload]) => {
                     const tokenTotals = updateFormattedFromMetrics(normalizeUsageBlock(tokenPayload?.totals || {}));
-                    const serviceBlocks = {};
-                    ['claude', 'codex'].forEach(service => {
-                        const servicePayload = tokenPayload?.services?.[service] || {};
-                        const overallBlock = adjustUsageBlockForService(service, servicePayload?.overall || {});
-                        const channels = {};
-                        Object.entries(servicePayload?.channels || {}).forEach(([channelName, channelPayload]) => {
-                            if (!channelName || channelName === 'unknown') {
-                                return;
-                            }
-                            channels[channelName] = adjustUsageBlockForService(service, channelPayload || {});
-                        });
-                        serviceBlocks[service] = {
-                            overall: overallBlock,
-                            channels
-                        };
+                const serviceBlocks = {};
+                tokenServiceKeys.forEach(service => {
+                    const servicePayload = tokenPayload?.services?.[service] || {};
+                    const overallBlock = adjustUsageBlockForService(service, servicePayload?.overall || {});
+                    const channels = {};
+                    Object.entries(servicePayload?.channels || {}).forEach(([channelName, channelPayload]) => {
+                        if (!channelName || channelName === 'unknown') {
+                            return;
+                        }
+                        channels[channelName] = adjustUsageBlockForService(service, channelPayload || {});
                     });
-                    tokens[tokenName] = {
-                        totals: tokenTotals,
-                        services: serviceBlocks
+                    serviceBlocks[service] = {
+                        overall: overallBlock,
+                        channels
                     };
                 });
+                tokens[tokenName] = {
+                    totals: tokenTotals,
+                    services: serviceBlocks
+                };
+            });
                 usageDetails.tokens = tokens;
 
                 if (serviceEntries.length === 0) {
@@ -2525,6 +2530,8 @@ const app = createApp({
             usageDetailsLoading,
             usageMetricLabels,
             metricKeys,
+            tokenServiceKeys,
+            tokenServiceLabels,
             friendlyConfigs,
             configEditMode,
             editingNewSite,

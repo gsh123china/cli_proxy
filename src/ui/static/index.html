@@ -1541,33 +1541,34 @@
                                     <span class="usage-value">{{ getUsageFormattedValue(tokenData.totals, key) }}</span>
                                 </div>
                             </div>
-                            <div
-                                class="usage-token-service-block"
-                                v-for="service in ['claude', 'codex']"
-                                :key="service"
-                                v-if="hasUsageData(tokenData.services[service]?.overall) || Object.keys(tokenData.services[service]?.channels || {}).length"
-                            >
-                                <div class="usage-token-service-header">
-                                    <h4>{{ service === 'claude' ? 'Claude' : 'Codex' }}</h4>
-                                    <span class="usage-total">总计 {{ getUsageFormattedValue(tokenData.services[service]?.overall, 'total') }}</span>
-                                </div>
-                                <div class="usage-summary-grid service-overall">
-                                    <div class="usage-summary-item" v-for="key in metricKeys" :key="key">
-                                        <span class="usage-label">{{ usageMetricLabels[key] }}:</span>
-                                        <span class="usage-value">{{ getUsageFormattedValue(tokenData.services[service]?.overall, key) }}</span>
+                            <div class="usage-token-service-list">
+                                <div
+                                    class="usage-token-service-block"
+                                    v-for="service in tokenServiceKeys"
+                                    :key="service"
+                                >
+                                    <div class="usage-service-header usage-token-service-header">
+                                        <h4>{{ tokenServiceLabels[service] }}</h4>
+                                        <span class="usage-total">总计 {{ getUsageFormattedValue(tokenData.services[service]?.overall, 'total') }}</span>
                                     </div>
-                                </div>
-                                <div v-if="Object.keys(tokenData.services[service]?.channels || {}).length" class="usage-channel-table">
-                                    <div class="usage-channel-header">
-                                        <span>目标站点</span>
-                                        <span v-for="key in metricKeys" :key="key">{{ usageMetricLabels[key] }}</span>
+                                    <div class="usage-summary-grid service-overall">
+                                        <div class="usage-summary-item" v-for="key in metricKeys" :key="key">
+                                            <span class="usage-label">{{ usageMetricLabels[key] }}:</span>
+                                            <span class="usage-value">{{ getUsageFormattedValue(tokenData.services[service]?.overall, key) }}</span>
+                                        </div>
                                     </div>
-                                    <div class="usage-channel-row" v-for="(channelData, channelName) in tokenData.services[service].channels" :key="channelName">
-                                        <span class="channel-name">{{ formatChannelName(channelName) }}</span>
-                                        <span v-for="key in metricKeys" :key="key">{{ getUsageFormattedValue(channelData, key) }}</span>
+                                    <div v-if="Object.keys(tokenData.services[service]?.channels || {}).length" class="usage-channel-table">
+                                        <div class="usage-channel-header">
+                                            <span>目标站点</span>
+                                            <span v-for="key in metricKeys" :key="key">{{ usageMetricLabels[key] }}</span>
+                                        </div>
+                                        <div class="usage-channel-row" v-for="(channelData, channelName) in tokenData.services[service].channels" :key="channelName">
+                                            <span class="channel-name">{{ formatChannelName(channelName) }}</span>
+                                            <span v-for="key in metricKeys" :key="key">{{ getUsageFormattedValue(channelData, key) }}</span>
+                                        </div>
                                     </div>
+                                    <div v-else class="usage-channel-empty">暂无渠道数据</div>
                                 </div>
-                                <div v-else class="usage-channel-empty">暂无渠道数据</div>
                             </div>
                         </div>
                     </div>

@@ -3,7 +3,7 @@ import hashlib
 import webbrowser
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 from flask import Flask, jsonify, send_file, request
 import os
 from datetime import datetime, timezone
@@ -15,6 +15,8 @@ from src.utils.usage_parser import (
     merge_usage_metrics,
     normalize_usage_record,
 )
+
+USAGE_SERVICES: Tuple[str, str] = ('claude', 'codex')
 
 # 数据目录 - 使用绝对路径
 DATA_DIR = Path.home() / '.clp/data'
@@ -550,16 +552,23 @@ def _extract_client_token(entry: Dict[str, Any]) -> str:
 
 def _clone_usage_by_token_map(data: Dict[str, Dict[str, Dict[str, Dict[str, int]]]]) -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
     """深拷贝 token usage 结构，避免原地修改。"""
-    return {
-        token: {
-            service: {
-                channel: dict(metrics)
-                for channel, metrics in channels.items()
-            }
-            for service, channels in services.items()
-        }
-        for token, services in data.items()
-    }
+    cloned: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {}
+    for token, services in data.items():
+        service_map: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for service, channels in services.items():
+            channel_map: Dict[str, Dict[str, int]] = {}
+            for channel, metrics in channels.items():
+                channel_map[channel] = dict(metrics)
+            service_map[service] = channel_map
+        _ensure_token_service_buckets(service_map)
+        cloned[token] = service_map
+    return cloned
+
+
+def _ensure_token_service_buckets(container: Dict[str, Dict[str, Dict[str, int]]]) -> None:
+    """确保 token usage map 至少包含 claude/codex 两个服务节点。"""
+    for service in USAGE_SERVICES:
+        container.setdefault(service, {})
 
 
 def aggregate_usage_by_token_from_logs(
@@ -598,11 +607,25 @@ def aggregate_usage_by_token_from_logs(
             token_info = None
 
         token_bucket = aggregated.setdefault(display_name, {})
+        _ensure_token_service_buckets(token_bucket)
         service_bucket = token_bucket.setdefault(service, {})
         channel_bucket = service_bucket.setdefault(channel, empty_metrics())
         merge_usage_metrics(channel_bucket, metrics)
 
-    return aggregated
+    for token_bucket in aggregated.values():
+        _ensure_token_service_buckets(token_bucket)
+
+    normalized: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {}
+    for token_name, services in aggregated.items():
+        service_map: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for service in USAGE_SERVICES:
+            service_map[service] = services.get(service, {})
+        for service, channels in services.items():
+            if service not in service_map:
+                service_map[service] = channels
+        normalized[token_name] = service_map
+
+    return normalized
 
 
 def build_log_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -730,6 +753,7 @@ def merge_history_usage_by_token(
 ) -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
     for token, services in addition.items():
         token_bucket = base.setdefault(token, {})
+        _ensure_token_service_buckets(token_bucket)
         for service, channels in services.items():
             service_bucket = token_bucket.setdefault(service, {})
             for channel, metrics in channels.items():
@@ -1349,7 +1373,11 @@ def get_usage_details():
         for token_name, services_map in combined_usage_by_token.items():
             service_blocks: Dict[str, Any] = {}
             token_totals = empty_metrics()
-            for service_name, channels_map in services_map.items():
+            _ensure_token_service_buckets(services_map)
+            for service_name in USAGE_SERVICES:
+                channels_map = services_map.get(service_name) or {}
+                if not isinstance(channels_map, dict):
+                    channels_map = {}
                 overall_metrics = compute_total_metrics(channels_map)
                 service_blocks[service_name] = {
                     'overall': {
@@ -1366,6 +1394,21 @@ def get_usage_details():
                 }
                 merge_usage_metrics(token_totals, overall_metrics)
 
+            normalized_service_blocks: Dict[str, Any] = {}
+            for service_name in USAGE_SERVICES:
+                block = service_blocks.get(service_name)
+                if block:
+                    normalized_service_blocks[service_name] = block
+                    continue
+                empty_block_metrics = empty_metrics()
+                normalized_service_blocks[service_name] = {
+                    'overall': {
+                        'metrics': empty_block_metrics,
+                        'formatted': format_metrics(empty_block_metrics)
+                    },
+                    'channels': {}
+                }
+
             if not any(token_totals.values()):
                 continue
 
@@ -1374,7 +1417,7 @@ def get_usage_details():
                     'metrics': token_totals,
                     'formatted': format_metrics(token_totals)
                 },
-                'services': service_blocks
+                'services': normalized_service_blocks
             }
 
         response = {
