@@ -32,7 +32,8 @@ const app = createApp({
             requestCount: 0,
             configCount: 0,
             filterCount: 0,
-            headerFilterCount: 0       // Header Filter 数量（新增）
+            headerFilterCount: 0,      // Header Filter 数量
+            endpointFilterCount: 0     // Endpoint Filter 数量（新增）
         });
         
         // 日志数据
@@ -51,6 +52,7 @@ const app = createApp({
         const configDrawerVisible = ref(false);
         const bodyFilterDrawerVisible = ref(false);      // Body Filter（原 filterDrawerVisible）
         const headerFilterDrawerVisible = ref(false);    // Header Filter（新增）
+        const endpointFilterDrawerVisible = ref(false);  // Endpoint Filter（新增）
         const logDetailVisible = ref(false);
         const allLogsVisible = ref(false);
         const logDetailLoading = ref(false);
@@ -71,6 +73,12 @@ const app = createApp({
         const headerFilterConfig = reactive({
             enabled: true,
             blocked_headers: []
+        });
+
+        // Endpoint Filter 配置（新增）
+        const endpointFilterConfig = reactive({
+            enabled: true,
+            rules: [] // [{ id, services:[], methods:[], matchType:'path'|'prefix'|'regex', matchValue:'', queryPairs:[{key,value}], action:{status,message} }]
         });
 
         // 友好表单的配置数据
@@ -1161,7 +1169,8 @@ const app = createApp({
             stats.requestCount = data.request_count || 0;
             stats.configCount = data.config_count || 0;
             stats.filterCount = data.filter_count || 0;
-            stats.headerFilterCount = data.header_filter_count || 0;  // 新增
+            stats.headerFilterCount = data.header_filter_count || 0;
+            stats.endpointFilterCount = data.endpoint_filter_count || 0;
 
             const summary = data.usage_summary || null;
             if (summary) {
@@ -1795,6 +1804,102 @@ const app = createApp({
             }
         };
 
+        // Endpoint Filter 相关方法（新增）
+        const openEndpointFilterDrawer = async () => {
+            endpointFilterDrawerVisible.value = true;
+            await loadEndpointFilter();
+        };
+        const closeEndpointFilterDrawer = () => {
+            endpointFilterDrawerVisible.value = false;
+        };
+        const HTTP_METHOD_OPTIONS = ['*','GET','POST','PUT','DELETE','PATCH','OPTIONS'];
+
+        const normalizeRuleForForm = (rule) => {
+            const r = { id: '', services: ['claude','codex'], methods: ['*'], matchType: 'path', matchValue: '', queryPairs: [], action: { status: 403, message: 'Endpoint is blocked by proxy' } };
+            if (typeof rule.id === 'string' && rule.id.trim()) r.id = rule.id.trim();
+            if (Array.isArray(rule.services) && rule.services.length) r.services = rule.services.map(s=>String(s).toLowerCase());
+            if (Array.isArray(rule.methods) && rule.methods.length) r.methods = rule.methods.map(m=>String(m).toUpperCase());
+            if (typeof rule.path === 'string' && rule.path.trim()) { r.matchType = 'path'; r.matchValue = rule.path; }
+            else if (typeof rule.prefix === 'string' && rule.prefix.trim()) { r.matchType = 'prefix'; r.matchValue = rule.prefix; }
+            else if (typeof rule.regex === 'string' && rule.regex.trim()) { r.matchType = 'regex'; r.matchValue = rule.regex; }
+            const q = rule.query || {};
+            if (q && typeof q === 'object') {
+                r.queryPairs = Object.entries(q).map(([k,v])=>({ key: String(k), value: (v===null||v===undefined)?'':String(v) }));
+            }
+            const a = rule.action || {};
+            r.action = { status: Number(a.status ?? 403), message: String(a.message ?? 'Endpoint is blocked by proxy') };
+            return r;
+        };
+        const denormalizeRuleForSave = (r) => {
+            const rule = {};
+            if (r.id && r.id.trim()) rule.id = r.id.trim();
+            if (Array.isArray(r.services) && r.services.length && !(r.services.length===2 && r.services.includes('claude') && r.services.includes('codex'))) {
+                rule.services = r.services.map(s=>String(s).toLowerCase());
+            }
+            if (Array.isArray(r.methods) && r.methods.length && !(r.methods.length===1 && r.methods[0]==='*')) {
+                rule.methods = r.methods.map(m=>String(m).toUpperCase());
+            }
+            if (r.matchType === 'path') rule.path = r.matchValue || '';
+            else if (r.matchType === 'prefix') rule.prefix = r.matchValue || '';
+            else if (r.matchType === 'regex') rule.regex = r.matchValue || '';
+            const qp = Array.isArray(r.queryPairs) ? r.queryPairs : [];
+            if (qp.length) {
+                const q = {};
+                qp.forEach(({key,value})=>{ if (String(key).trim()) q[String(key)] = (String(value).trim()||String(value)==='') ? String(value) : String(value); });
+                rule.query = q;
+            }
+            rule.action = { type: 'block', status: Number(r.action?.status ?? 403), message: String(r.action?.message ?? 'Endpoint is blocked by proxy') };
+            return rule;
+        };
+        const loadEndpointFilter = async () => {
+            try {
+                const data = await fetchWithErrorHandling('/api/endpoint-filter');
+                const cfg = data.config || { enabled: true, rules: [] };
+                endpointFilterConfig.enabled = !!cfg.enabled;
+                const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
+                endpointFilterConfig.rules = rules.map(normalizeRuleForForm);
+            } catch (e) {
+                endpointFilterConfig.enabled = true;
+                endpointFilterConfig.rules = [];
+                ElMessage.error('加载 Endpoint 过滤配置失败: ' + e.message);
+            }
+        };
+        const saveEndpointFilter = async () => {
+            try {
+                const payload = {
+                    enabled: endpointFilterConfig.enabled,
+                    rules: endpointFilterConfig.rules.map(denormalizeRuleForSave)
+                };
+                const result = await fetchWithErrorHandling('/api/endpoint-filter', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (result.success) {
+                    ElMessage.success(result.message || 'Endpoint 过滤配置保存成功');
+                    await refreshData();
+                } else {
+                    ElMessage.error(result.error || '保存失败');
+                }
+            } catch (e) {
+                ElMessage.error('保存 Endpoint 过滤配置失败: ' + e.message);
+            }
+        };
+        const addEndpointRule = () => {
+            endpointFilterConfig.rules.push({
+                id: '', services: ['claude','codex'], methods: ['*'], matchType: 'path', matchValue: '', queryPairs: [], action: { status: 403, message: 'Endpoint is blocked by proxy' }
+            });
+        };
+        const removeEndpointRule = (idx) => {
+            endpointFilterConfig.rules.splice(idx, 1);
+        };
+        const addQueryPair = (rule) => {
+            rule.queryPairs.push({ key: '', value: '' });
+        };
+        const removeQueryPair = (rule, i) => {
+            rule.queryPairs.splice(i, 1);
+        };
+
         const loadFilter = async () => {
             try {
                 const data = await fetchWithErrorHandling('/api/filter');
@@ -2398,6 +2503,7 @@ const app = createApp({
             configDrawerVisible,
             bodyFilterDrawerVisible,        // 重命名
             headerFilterDrawerVisible,      // 新增
+            endpointFilterDrawerVisible,    // 新增
             logDetailVisible,
             logDetailLoading,
             logDetailError,
@@ -2408,6 +2514,7 @@ const app = createApp({
             filterContent,
             filterRules,
             headerFilterConfig,             // 新增
+            endpointFilterConfig,           // 新增
             headerFilterSaving,             // 新增
             selectedLog,
             decodedRequestBody,
@@ -2450,6 +2557,15 @@ const app = createApp({
             addBlockedHeader,               // 新增
             removeBlockedHeader,            // 新增
             applyHeaderPreset,              // 新增
+            openEndpointFilterDrawer,       // 新增
+            closeEndpointFilterDrawer,      // 新增
+            loadEndpointFilter,             // 新增
+            saveEndpointFilter,             // 新增
+            addEndpointRule,                // 新增
+            removeEndpointRule,             // 新增
+            addQueryPair,                   // 新增
+            removeQueryPair,                // 新增
+            HTTP_METHOD_OPTIONS,            // 新增
             formatTimestamp,
             truncatePath,
             getStatusTagType,

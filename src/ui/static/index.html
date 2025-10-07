@@ -117,6 +117,11 @@
                             <div class="stat-value">{{ stats.headerFilterCount || 0 }}</div>
                             <div class="stat-hint">过滤隐私信息</div>
                         </div>
+                        <div class="stat-card clickable" @click="openEndpointFilterDrawer">
+                            <h4>请求接口过滤</h4>
+                            <div class="stat-value">{{ stats.endpointFilterCount || 0 }}</div>
+                            <div class="stat-hint">阻断特定接口</div>
+                        </div>
                         <div class="stat-card clickable usage-card" @click="openUsageDrawer">
                             <h4>Token 使用</h4>
                             <div class="stat-value">{{ usageSummary.formattedTotals.total || '0' }}</div>
@@ -941,6 +946,86 @@
                         size="small">
                         重新加载
                     </el-button>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- Endpoint Filter (请求接口过滤器) 编辑抽屉 -->
+        <el-drawer
+            v-model="endpointFilterDrawerVisible"
+            title="请求接口过滤器编辑"
+            size="900px"
+            class="endpoint-filter-drawer">
+            <div class="filter-info-box" style="background: #f6ffed; border-left: 4px solid #67c23a; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>作用：</strong>按方法/路径/查询参数阻断请求，不向上游转发</p>
+                <p style="margin: 5px 0; font-size: 14px; color: #606266;"><strong>日志：</strong>原始请求头与体仍会写入本地日志审计</p>
+            </div>
+
+            <div style="margin: 16px 0;">
+                <el-switch v-model="endpointFilterConfig.enabled" active-text="启用 接口过滤" inactive-text="禁用"></el-switch>
+            </div>
+
+            <div class="filter-editor">
+                <div class="filter-rules-container">
+                    <div v-for="(rule, index) in endpointFilterConfig.rules" :key="index" class="filter-rule-row" style="align-items: flex-start;">
+                        <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                            <div>
+                                <label class="field-label">规则ID</label>
+                                <el-input v-model="rule.id" placeholder="可选，用于标识与审计"></el-input>
+                            </div>
+                            <div>
+                                <label class="field-label">服务</label>
+                                <el-checkbox-group v-model="rule.services">
+                                    <el-checkbox label="claude">Claude</el-checkbox>
+                                    <el-checkbox label="codex">Codex</el-checkbox>
+                                </el-checkbox-group>
+                            </div>
+                            <div>
+                                <label class="field-label">方法</label>
+                                <el-select v-model="rule.methods" multiple placeholder="* 任意">
+                                    <el-option v-for="m in HTTP_METHOD_OPTIONS" :key="m" :label="m" :value="m"></el-option>
+                                </el-select>
+                            </div>
+                            <div>
+                                <label class="field-label">匹配方式</label>
+                                <el-radio-group v-model="rule.matchType" size="small">
+                                    <el-radio-button label="path">精确路径</el-radio-button>
+                                    <el-radio-button label="prefix">前缀匹配</el-radio-button>
+                                    <el-radio-button label="regex">正则匹配</el-radio-button>
+                                </el-radio-group>
+                                <el-input v-model="rule.matchValue" placeholder="例如：/api/v1/messages/count_tokens 或 ^/internal/.*$" style="margin-top: 6px;"></el-input>
+                            </div>
+
+                            <div style="grid-column: 1 / span 2;">
+                                <label class="field-label">查询参数（全部满足）</label>
+                                <div style="display: flex; flex-direction: column; gap: 6px;">
+                                    <div v-for="(pair, i) in rule.queryPairs" :key="i" style="display:flex; gap:8px; align-items: center;">
+                                        <el-input v-model="pair.key" placeholder="参数名，如 beta" style="width: 200px;"></el-input>
+                                        <el-input v-model="pair.value" placeholder="参数值，* 表示存在即可" style="width: 240px;"></el-input>
+                                        <el-button type="danger" icon="el-icon-delete" circle size="small" @click="removeQueryPair(rule, i)"></el-button>
+                                    </div>
+                                    <el-button size="small" type="success" @click="addQueryPair(rule)"><i class="el-icon-plus"></i> 添加参数</el-button>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="field-label">阻断状态码</label>
+                                <el-input-number v-model.number="rule.action.status" :min="100" :max="599"></el-input-number>
+                            </div>
+                            <div>
+                                <label class="field-label">错误消息</label>
+                                <el-input v-model="rule.action.message" placeholder="Endpoint is blocked by proxy"></el-input>
+                            </div>
+                        </div>
+
+                        <el-button @click="removeEndpointRule(index)" type="danger" icon="el-icon-delete" circle size="small" style="margin-left: 10px;"></el-button>
+                    </div>
+                </div>
+
+                <div style="margin-top: 10px; display:flex; gap:10px;">
+                    <el-button type="success" size="small" icon="el-icon-plus" @click="addEndpointRule">添加规则</el-button>
+                    <el-button type="primary" size="small" @click="saveEndpointFilter">保存配置</el-button>
+                    <el-button size="small" @click="loadEndpointFilter">重新加载</el-button>
                 </div>
             </div>
         </el-drawer>

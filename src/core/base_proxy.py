@@ -113,6 +113,14 @@ class BaseProxyService(ABC):
         except ImportError as e:
             print(f"警告: Header 过滤器加载失败: {e}")
             self.header_filter = None
+
+        # 导入 Endpoint 过滤器
+        try:
+            from ..filter.cached_endpoint_filter import CachedEndpointFilter
+            self.endpoint_filter = CachedEndpointFilter()
+        except ImportError as e:
+            print(f"警告: Endpoint 过滤器加载失败: {e}")
+            self.endpoint_filter = None
     
     def _create_async_client(self) -> httpx.AsyncClient:
         """创建并配置 httpx AsyncClient"""
@@ -200,6 +208,9 @@ class BaseProxyService(ABC):
         response_truncated: bool = False,
         total_response_bytes: Optional[int] = None,
         target_url: Optional[str] = None,
+        blocked: Optional[bool] = None,
+        blocked_by: Optional[str] = None,
+        blocked_reason: Optional[str] = None,
     ):
         """记录请求日志到jsonl文件（异步调度）"""
 
@@ -242,6 +253,13 @@ class BaseProxyService(ABC):
 
                 if total_response_bytes is not None:
                     log_entry['response_bytes'] = total_response_bytes
+
+                if blocked is not None:
+                    log_entry['blocked'] = bool(blocked)
+                if blocked_by is not None:
+                    log_entry['blocked_by'] = blocked_by
+                if blocked_reason is not None:
+                    log_entry['blocked_reason'] = blocked_reason
 
                 # 限制日志文件为最多1000条记录
                 self._maintain_log_limit(log_entry)
@@ -779,6 +797,73 @@ class BaseProxyService(ABC):
 
         original_headers = {k: v for k, v in request.headers.items()}
         original_body = await request.body()
+
+        # —— 接口过滤：最先判定，命中则直接阻断 ——
+        try:
+            if self.endpoint_filter:
+                self.endpoint_filter.reload()
+                # 以 Request.url.path 作为匹配路径，始终带前导 '/'
+                full_path = request.url.path
+                # 将查询参数标准化为首值字典
+                qd = {}
+                try:
+                    for k in request.query_params.keys():
+                        qd[k] = request.query_params.get(k)
+                except Exception:
+                    qd = {}
+                mr = self.endpoint_filter.match(self.service_name, request.method, full_path, qd)
+                if mr:
+                    # 广播实时事件
+                    try:
+                        await self.realtime_hub.request_started(
+                            request_id=request_id,
+                            method=request.method,
+                            path=full_path,
+                            channel="blocked",
+                            headers=original_headers,
+                            target_url=None,
+                        )
+                    except Exception:
+                        pass
+
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    try:
+                        await self.realtime_hub.request_completed(
+                            request_id=request_id,
+                            status_code=mr.status,
+                            duration_ms=duration_ms,
+                            success=False,
+                        )
+                    except Exception:
+                        pass
+
+                    # 记录日志（原始头/体保留审计）
+                    await self.log_request(
+                        method=request.method,
+                        path=full_path,
+                        status_code=mr.status,
+                        duration_ms=duration_ms,
+                        target_headers=None,
+                        filtered_body=None,
+                        original_headers=original_headers,
+                        original_body=original_body,
+                        response_content=None,
+                        channel="blocked",
+                        target_url=None,
+                        blocked=True,
+                        blocked_by=mr.rule_id,
+                        blocked_reason=mr.message,
+                    )
+
+                    return JSONResponse({
+                        "error": "ENDPOINT_BLOCKED",
+                        "message": mr.message,
+                        "rule_id": mr.rule_id,
+                        "service": self.service_name,
+                    }, status_code=mr.status)
+        except Exception as e:
+            # 过滤器的异常不能影响正常转发
+            print(f"Endpoint 过滤判定失败: {e}")
 
         active_config_name: Optional[str] = None
         target_headers: Optional[Dict[str, str]] = None

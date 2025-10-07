@@ -868,6 +868,19 @@ def get_status():
             except (json.JSONDecodeError, IOError):
                 header_filter_count = 0
 
+        # 计算 Endpoint Filter 规则数量
+        endpoint_filter_file = Path.home() / '.clp' / 'endpoint_filter.json'
+        endpoint_filter_count = 0
+        if endpoint_filter_file.exists():
+            try:
+                with open(endpoint_filter_file, 'r', encoding='utf-8') as f:
+                    endpoint_filter_data = json.load(f)
+                    rules = endpoint_filter_data.get('rules') or []
+                    if isinstance(rules, list):
+                        endpoint_filter_count = len(rules)
+            except (json.JSONDecodeError, IOError):
+                endpoint_filter_count = 0
+
         data = {
             'services': {
                 'claude': {
@@ -885,6 +898,7 @@ def get_status():
             'config_count': total_configs,
             'filter_count': filter_count,
             'header_filter_count': header_filter_count,
+            'endpoint_filter_count': endpoint_filter_count,
             'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'usage_summary': usage_summary
         }
@@ -1118,6 +1132,114 @@ def save_header_filter():
 
         return jsonify({'success': True, 'message': 'Header 过滤配置保存成功'})
 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/endpoint-filter', methods=['GET'])
+def get_endpoint_filter():
+    """获取 Endpoint 过滤配置"""
+    try:
+        filter_file = Path.home() / '.clp' / 'endpoint_filter.json'
+        if not filter_file.exists():
+            default_config = { 'enabled': True, 'rules': [] }
+            return jsonify({'config': default_config})
+        with open(filter_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            config = { 'enabled': True, 'rules': [] }
+        if 'enabled' not in config:
+            config['enabled'] = True
+        if not isinstance(config.get('rules'), list):
+            config['rules'] = []
+        return jsonify({'config': config})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/endpoint-filter', methods=['POST'])
+def save_endpoint_filter():
+    """保存 Endpoint 过滤配置"""
+    try:
+        data = request.get_json(silent=True) or {}
+        enabled = bool(data.get('enabled', True))
+        rules = data.get('rules', [])
+
+        if not isinstance(rules, list):
+            return jsonify({'error': 'rules must be an array'}), 400
+
+        normalized_rules = []
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                return jsonify({'error': f'rules[{idx}] must be an object'}), 400
+
+            nr = {}
+            # id
+            if 'id' in rule and isinstance(rule['id'], str) and rule['id'].strip():
+                nr['id'] = rule['id'].strip()
+
+            # services
+            if rule.get('services') is not None:
+                if not isinstance(rule['services'], list):
+                    return jsonify({'error': f'rules[{idx}].services must be an array'}), 400
+                nr['services'] = [str(s).strip().lower() for s in rule['services'] if str(s).strip()]
+
+            # methods
+            if rule.get('methods') is not None:
+                if not isinstance(rule['methods'], list):
+                    return jsonify({'error': f'rules[{idx}].methods must be an array'}), 400
+                nr['methods'] = [str(m).strip().upper() for m in rule['methods'] if str(m).strip()]
+
+            # matcher: exactly one of path/prefix/regex must be present
+            path = rule.get('path'); prefix = rule.get('prefix'); regex = rule.get('regex')
+            count = int(bool(path)) + int(bool(prefix)) + int(bool(regex))
+            if count != 1:
+                return jsonify({'error': f'rules[{idx}] must specify exactly one of path/prefix/regex'}), 400
+            if path:
+                if not isinstance(path, str) or not path.strip():
+                    return jsonify({'error': f'rules[{idx}].path must be a non-empty string'}), 400
+                nr['path'] = path.strip()
+            if prefix:
+                if not isinstance(prefix, str) or not prefix.strip():
+                    return jsonify({'error': f'rules[{idx}].prefix must be a non-empty string'}), 400
+                nr['prefix'] = prefix.strip()
+            if regex:
+                if not isinstance(regex, str) or not regex.strip():
+                    return jsonify({'error': f'rules[{idx}].regex must be a non-empty string'}), 400
+                nr['regex'] = regex.strip()
+
+            # query (optional)
+            if rule.get('query') is not None:
+                if not isinstance(rule['query'], dict):
+                    return jsonify({'error': f'rules[{idx}].query must be an object'}), 400
+                qn = {}
+                for k, v in rule['query'].items():
+                    ks = str(k)
+                    if v is None:
+                        qn[ks] = None
+                    else:
+                        qn[ks] = str(v)
+                nr['query'] = qn
+
+            # action (block only)
+            action = rule.get('action') or {}
+            if not isinstance(action, dict):
+                return jsonify({'error': f'rules[{idx}].action must be an object'}), 400
+            atype = str(action.get('type') or 'block').strip().lower()
+            if atype != 'block':
+                return jsonify({'error': f'rules[{idx}].action.type must be "block"'}), 400
+            status = int(action.get('status') or 403)
+            message = str(action.get('message') or 'Endpoint is blocked by proxy')
+            nr['action'] = {'type': 'block', 'status': status, 'message': message}
+
+            normalized_rules.append(nr)
+
+        payload = { 'enabled': enabled, 'rules': normalized_rules }
+        filter_file = Path.home() / '.clp' / 'endpoint_filter.json'
+        filter_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(filter_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return jsonify({'success': True, 'message': 'Endpoint 过滤配置保存成功'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

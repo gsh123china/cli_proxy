@@ -973,6 +973,31 @@ def custom_filter(data: bytes) -> bytes:
     return filtered_data
 ```
 
+### 请求接口过滤（endpoint_filter.json）
+
+- 位置：`~/.clp/endpoint_filter.json`
+- 作用：按“方法 + 路径(精确/前缀/正则) + 查询参数”匹配并阻断请求，不向上游转发；原始请求会被记录到本地日志用于审计；UI 提供可视化管理。
+
+最小示例（拦截 /api/v1/messages/count_tokens?beta=true）：
+
+```json
+{
+  "enabled": true,
+  "rules": [
+    {
+      "id": "block-count-tokens",
+      "services": ["claude", "codex"],
+      "methods": ["GET", "POST"],
+      "path": "/api/v1/messages/count_tokens",
+      "query": { "beta": "true" },
+      "action": { "type": "block", "status": 403, "message": "count_tokens disabled" }
+    }
+  ]
+}
+```
+
+说明：`services` 缺省表示两者皆适用；`methods` 缺省为 `[*]` 任意；`query` 为 AND 关系，值为 `"*"` 表示“仅需存在”。命中后日志会包含 `blocked_by` 与 `blocked_reason` 字段，实时面板 `channel` 显示为 `blocked`。
+
 ## 特性说明
 
 ### 异步处理
