@@ -104,7 +104,9 @@ class RealTimeRequestHub:
         message = json.dumps(event_data, ensure_ascii=False)
         disconnected = set()
 
-        for i, connection in enumerate(self.connections):
+        connections_snapshot = list(self.connections)
+
+        for connection in connections_snapshot:
             try:
                 await connection.send_text(message)
             except Exception as e:

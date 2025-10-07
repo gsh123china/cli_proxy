@@ -8,6 +8,7 @@ import base64
 import json
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -78,6 +79,10 @@ class BaseProxyService(ABC):
 
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
+
+        # 并发控制锁
+        self._lb_lock = threading.RLock()
+        self._log_lock = threading.RLock()
 
         # 初始化FastAPI应用
         self.app = FastAPI()
@@ -242,40 +247,41 @@ class BaseProxyService(ABC):
 
     def _maintain_log_limit(self, new_log_entry: dict, max_logs: int = 100):
         """维护日志文件条数限制，只保留最近的max_logs条记录"""
-        try:
-            # 读取现有日志
-            existing_logs = []
-            if self.traffic_log.exists():
-                with open(self.traffic_log, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                log_data = json.loads(line)
-                                existing_logs.append(log_data)
-                            except json.JSONDecodeError:
-                                continue
-            
-            # 添加新日志条目
-            existing_logs.append(new_log_entry)
-            
-            # 只保留最近的max_logs条记录
-            if len(existing_logs) > max_logs:
-                existing_logs = existing_logs[-max_logs:]
-            
-            # 重写整个日志文件
-            with open(self.traffic_log, 'w', encoding='utf-8') as f:
-                for log_entry in existing_logs:
-                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-                    
-        except Exception as exc:
-            print(f"维护日志文件限制失败: {exc}")
-            # 如果维护失败，直接追加写入
+        with self._log_lock:
             try:
-                with open(self.traffic_log, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(new_log_entry, ensure_ascii=False) + '\n')
-            except Exception as fallback_exc:
-                print(f"备用日志写入也失败: {fallback_exc}")
+                # 读取现有日志
+                existing_logs = []
+                if self.traffic_log.exists():
+                    with open(self.traffic_log, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    log_data = json.loads(line)
+                                    existing_logs.append(log_data)
+                                except json.JSONDecodeError:
+                                    continue
+
+                # 添加新日志条目
+                existing_logs.append(new_log_entry)
+
+                # 只保留最近的max_logs条记录
+                if len(existing_logs) > max_logs:
+                    existing_logs = existing_logs[-max_logs:]
+
+                # 重写整个日志文件
+                with open(self.traffic_log, 'w', encoding='utf-8') as f:
+                    for log_entry in existing_logs:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+
+            except Exception as exc:
+                print(f"维护日志文件限制失败: {exc}")
+                # 如果维护失败，直接追加写入
+                try:
+                    with open(self.traffic_log, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(new_log_entry, ensure_ascii=False) + '\n')
+                except Exception as fallback_exc:
+                    print(f"备用日志写入也失败: {fallback_exc}")
 
     def _get_file_signature(self, file_path: Path) -> Tuple[int, int]:
         """获取文件签名，用于检测内容变化"""
@@ -384,24 +390,35 @@ class BaseProxyService(ABC):
 
     def _ensure_lb_config_current(self):
         """检查负载均衡配置是否有更新"""
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+
+    def _persist_lb_config(self):
+        """持久化负载均衡配置"""
+        with self._lb_lock:
+            self._persist_lb_config_locked()
+
+    def reload_lb_config(self):
+        """重新加载负载均衡配置"""
+        with self._lb_lock:
+            self.lb_config = self._load_lb_config()
+            self.lb_config_signature = self._get_file_signature(self.lb_config_file)
+
+    def _ensure_lb_config_current_locked(self):
+        """假定已获取锁的情况下检查配置更新"""
         current_signature = self._get_file_signature(self.lb_config_file)
         if current_signature != self.lb_config_signature:
             self.lb_config = self._load_lb_config()
             self.lb_config_signature = current_signature
 
-    def _persist_lb_config(self):
-        """持久化负载均衡配置"""
+    def _persist_lb_config_locked(self):
+        """假定已获取锁的情况下持久化配置"""
         try:
             with open(self.lb_config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.lb_config, f, ensure_ascii=False, indent=2)
             self.lb_config_signature = self._get_file_signature(self.lb_config_file)
         except OSError as exc:
             print(f"保存负载均衡配置失败: {exc}")
-
-    def reload_lb_config(self):
-        """重新加载负载均衡配置"""
-        self.lb_config = self._load_lb_config()
-        self.lb_config_signature = self._get_file_signature(self.lb_config_file)
 
     def _apply_model_routing(self, body: bytes) -> Tuple[bytes, Optional[str]]:
         """应用模型路由规则，返回修改后的body和要使用的配置名"""
@@ -488,16 +505,17 @@ class BaseProxyService(ABC):
 
     def _select_config_by_loadbalance(self, configs: Dict[str, Dict[str, Any]]) -> Optional[str]:
         """根据负载均衡策略选择配置名"""
-        self._ensure_lb_config_current()
-        mode = self.lb_config.get('mode', 'active-first')
-        if mode == 'weight-based':
-            selected = self._select_weighted_config(configs)
-            if selected:
-                return selected
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            mode = self.lb_config.get('mode', 'active-first')
+            if mode == 'weight-based':
+                selected = self._select_weighted_config_locked(configs)
+                if selected:
+                    return selected
         return self.config_manager.active_config
 
-    def _select_weighted_config(self, configs: Dict[str, Dict[str, Any]]) -> Optional[str]:
-        """按权重选择配置"""
+    def _select_weighted_config_locked(self, configs: Dict[str, Dict[str, Any]]) -> Optional[str]:
+        """按权重选择配置（要求已持有负载均衡锁）"""
         if not configs:
             return None
 
@@ -533,37 +551,38 @@ class BaseProxyService(ABC):
         if not config_name:
             return
 
-        self._ensure_lb_config_current()
-        if self.lb_config.get('mode', 'active-first') != 'weight-based':
-            return
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            if self.lb_config.get('mode', 'active-first') != 'weight-based':
+                return
 
-        self._ensure_lb_service_section(self.lb_config, self.service_name)
-        service_section = self.lb_config['services'][self.service_name]
-        threshold = service_section.get('failureThreshold', 3)
-        failures = service_section.setdefault('currentFailures', {})
-        excluded = service_section.setdefault('excludedConfigs', [])
+            self._ensure_lb_service_section(self.lb_config, self.service_name)
+            service_section = self.lb_config['services'][self.service_name]
+            threshold = service_section.get('failureThreshold', 3)
+            failures = service_section.setdefault('currentFailures', {})
+            excluded = service_section.setdefault('excludedConfigs', [])
 
-        changed = False
-        is_success = status_code is not None and self._is_success_status(int(status_code))
+            changed = False
+            is_success = status_code is not None and self._is_success_status(int(status_code))
 
-        if is_success:
-            if failures.get(config_name, 0) != 0:
-                failures[config_name] = 0
-                changed = True
-            if config_name in excluded:
-                excluded.remove(config_name)
-                changed = True
-        else:
-            new_count = failures.get(config_name, 0) + 1
-            if failures.get(config_name) != new_count:
-                failures[config_name] = new_count
-                changed = True
-            if new_count >= threshold and config_name not in excluded:
-                excluded.append(config_name)
-                changed = True
+            if is_success:
+                if failures.get(config_name, 0) != 0:
+                    failures[config_name] = 0
+                    changed = True
+                if config_name in excluded:
+                    excluded.remove(config_name)
+                    changed = True
+            else:
+                new_count = failures.get(config_name, 0) + 1
+                if failures.get(config_name) != new_count:
+                    failures[config_name] = new_count
+                    changed = True
+                if new_count >= threshold and config_name not in excluded:
+                    excluded.append(config_name)
+                    changed = True
 
-        if changed:
-            self._persist_lb_config()
+            if changed:
+                self._persist_lb_config_locked()
 
     def _is_success_status(self, sc: int) -> bool:
         """定义成功的HTTP状态：2xx + 白名单3xx(304/307)"""
@@ -574,18 +593,21 @@ class BaseProxyService(ABC):
         if not configs:
             return []
 
-        self._ensure_lb_config_current()
-        service_section = self.lb_config.get('services', {}).get(self.service_name, {})
-        threshold = service_section.get('failureThreshold', 3)
-        failures = service_section.get('currentFailures', {})
-        excluded = set(service_section.get('excludedConfigs', []))
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            service_section = self.lb_config.get('services', {}).get(self.service_name, {})
+            threshold = service_section.get('failureThreshold', 3)
+            failures = service_section.get('currentFailures', {})
+            excluded = set(service_section.get('excludedConfigs', []))
 
-        sorted_configs = sorted(
-            configs.items(),
-            key=lambda item: (-float(item[1].get('weight', 0) or 0), item[0])
-        )
+            sorted_configs = sorted(
+                configs.items(),
+                key=lambda item: (-float(item[1].get('weight', 0) or 0), item[0])
+            )
 
-        healthy = [name for name, _ in sorted_configs if failures.get(name, 0) < threshold and name not in excluded]
+            healthy = [name for name, _ in sorted_configs if failures.get(name, 0) < threshold and name not in excluded]
+            fallback_name = sorted_configs[0][0] if sorted_configs else None
+
         if healthy:
             return healthy
 
@@ -593,29 +615,36 @@ class BaseProxyService(ABC):
         active_config = self.config_manager.active_config
         if active_config in configs:
             return [active_config]
-        return [sorted_configs[0][0]]
+        return [fallback_name] if fallback_name else []
 
     def _reset_lb_service_failures(self) -> bool:
         """重置当前服务的失败计数并记录时间戳；返回是否执行了重置（受冷却期限制）"""
-        self._ensure_lb_config_current()
-        options = self.lb_config.setdefault('options', {})
-        cooldown = int(options.get('resetCooldownSeconds', 30) or 30)
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            options = self.lb_config.setdefault('options', {})
+            cooldown = int(options.get('resetCooldownSeconds', 30) or 30)
 
-        service_section = self.lb_config['services'][self.service_name]
-        last_reset = float(service_section.get('lastResetAt', 0) or 0)
-        now = time.time()
-        if last_reset and (now - last_reset) < cooldown:
-            return False
+            service_section = self.lb_config['services'][self.service_name]
+            last_reset = float(service_section.get('lastResetAt', 0) or 0)
+            now = time.time()
+            if last_reset and (now - last_reset) < cooldown:
+                return False
 
-        service_section['currentFailures'] = {}
-        service_section['excludedConfigs'] = []
-        service_section['lastResetAt'] = now
-        self._persist_lb_config()
-        return True
+            service_section['currentFailures'] = {}
+            service_section['excludedConfigs'] = []
+            service_section['lastResetAt'] = now
+            self._persist_lb_config_locked()
+            return True
 
     def _get_lb_options(self) -> dict:
-        self._ensure_lb_config_current()
-        return self.lb_config.get('options', {})
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            return dict(self.lb_config.get('options', {}))
+
+    def _get_lb_mode(self) -> str:
+        with self._lb_lock:
+            self._ensure_lb_config_current_locked()
+            return self.lb_config.get('mode', 'active-first')
 
     def build_target_param(self, path: str, request: Request, body: bytes) -> Tuple[str, Dict, bytes, Optional[str]]:
         """
@@ -746,7 +775,7 @@ class BaseProxyService(ABC):
 
         # 构建候选序列
         configs = self.config_manager.configs
-        lb_mode = self.lb_config.get('mode', 'active-first')
+        lb_mode = self._get_lb_mode()
         auto_reset_enabled = bool(self._get_lb_options().get('autoResetOnAllFailed', True))
 
         def _build_target_param_for_config(config_name: str):
@@ -987,12 +1016,16 @@ class BaseProxyService(ABC):
 
         async def run_round(candidates: list, round_index: int):
             nonlocal previous_candidate, attempt_counter, candidates_history_error, last_status_code
-            service_section = self.lb_config['services'][self.service_name]
-            threshold = service_section.get('failureThreshold', 3)
             for cand in candidates:
+                with self._lb_lock:
+                    self._ensure_lb_config_current_locked()
+                    service_section = self.lb_config['services'][self.service_name]
+                    threshold = service_section.get('failureThreshold', 3)
+                    failures_snapshot = dict(service_section.get('currentFailures', {}))
+
                 attempt_counter += 1
                 if previous_candidate and previous_candidate != cand:
-                    failures = service_section.get('currentFailures', {}).get(previous_candidate, 0)
+                    failures = failures_snapshot.get(previous_candidate, 0)
                     reason = 'http_non2xx' if (last_status_code and not (200 <= int(last_status_code) < 300)) else 'request_error'
                     await self.realtime_hub.lb_switch(
                         request_id,
@@ -1024,12 +1057,15 @@ class BaseProxyService(ABC):
         # 第一轮全部失败：根据选项判断是否自动重置并进行第二轮
         if auto_reset_enabled and self._reset_lb_service_failures():
             # 广播重置事件
-            svc_section = self.lb_config['services'][self.service_name]
+            with self._lb_lock:
+                self._ensure_lb_config_current_locked()
+                svc_section = self.lb_config['services'][self.service_name]
+                threshold_value = svc_section.get('failureThreshold', 3)
             await self.realtime_hub.lb_reset(
                 request_id,
                 reason='last_candidate_failed',
                 total_configs=len(configs),
-                threshold=svc_section.get('failureThreshold', 3)
+                threshold=threshold_value
             )
             # 第二轮：重置后等价于所有候选健康，直接按权重排序
             sorted_all = sorted(configs.items(), key=lambda item: (-float(item[1].get('weight', 0) or 0), item[0]))
