@@ -263,6 +263,29 @@ class RealTimeRequestHub:
         except Exception as e:
             self.logger.error(f"广播 lb_reset 事件失败: {e}")
 
+    async def lb_exhausted(
+        self,
+        request_id: str,
+        reason: str,
+        total_configs: int,
+        threshold: int,
+        cooldown_seconds: int,
+        cooldown_remaining_seconds: int,
+    ):
+        """当无健康候选且未触发自动重置时广播通知（权重模式）。"""
+        try:
+            await self.broadcast_event(
+                "lb_exhausted",
+                request_id,
+                reason=reason,
+                total_configs=total_configs,
+                threshold=threshold,
+                cooldown_seconds=cooldown_seconds,
+                cooldown_remaining_seconds=cooldown_remaining_seconds,
+            )
+        except Exception as e:
+            self.logger.error(f"广播 lb_exhausted 事件失败: {e}")
+
     async def _delayed_cleanup(self, request_id: str, delay_seconds: int):
         """延迟清理请求"""
         try:

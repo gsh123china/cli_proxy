@@ -509,13 +509,14 @@ class BaseProxyService(ABC):
             self._ensure_lb_config_current_locked()
             mode = self.lb_config.get('mode', 'active-first')
             if mode == 'weight-based':
-                selected = self._select_weighted_config_locked(configs)
-                if selected:
-                    return selected
+                return self._select_weighted_config_locked(configs)
         return self.config_manager.active_config
 
     def _select_weighted_config_locked(self, configs: Dict[str, Dict[str, Any]]) -> Optional[str]:
-        """按权重选择配置（要求已持有负载均衡锁）"""
+        """按权重选择配置（要求已持有负载均衡锁）。
+
+        仅返回健康候选；当无健康候选时返回 None，避免继续尝试已被暂时跳过的上游。
+        """
         if not configs:
             return None
 
@@ -536,10 +537,8 @@ class BaseProxyService(ABC):
                 continue
             return name
 
-        active_config = self.config_manager.active_config
-        if active_config in configs:
-            return active_config
-        return sorted_configs[0][0] if sorted_configs else None
+        # 无健康候选时，不再回退到任意配置，返回 None
+        return None
 
     def reload_routing_config(self):
         """重新加载路由配置"""
@@ -573,7 +572,9 @@ class BaseProxyService(ABC):
                     excluded.remove(config_name)
                     changed = True
             else:
-                new_count = failures.get(config_name, 0) + 1
+                # 失败计数递增，但不超过阈值，避免 UI 显示超过阈值的异常数字
+                prev = int(failures.get(config_name, 0) or 0)
+                new_count = min(prev + 1, int(threshold or 1))
                 if failures.get(config_name) != new_count:
                     failures[config_name] = new_count
                     changed = True
@@ -589,7 +590,10 @@ class BaseProxyService(ABC):
         return (200 <= sc < 300) or sc in {304, 307}
 
     def _get_candidate_order(self, configs: Dict[str, Dict[str, Any]]) -> list:
-        """按权重返回健康候选列表；若无健康项，返回兜底单项列表"""
+        """按权重返回健康候选列表；若无健康项，不再兜底回退。
+
+        这样可确保“已暂时跳过”的上游不会被继续尝试。
+        """
         if not configs:
             return []
 
@@ -611,11 +615,8 @@ class BaseProxyService(ABC):
         if healthy:
             return healthy
 
-        # 兜底：当无健康候选时，至少尝试一个
-        active_config = self.config_manager.active_config
-        if active_config in configs:
-            return [active_config]
-        return [fallback_name] if fallback_name else []
+        # 无健康候选：返回空列表，交由上层走重置或直接失败逻辑
+        return []
 
     def _reset_lb_service_failures(self) -> bool:
         """重置当前服务的失败计数并记录时间戳；返回是否执行了重置（受冷却期限制）"""
@@ -929,8 +930,10 @@ class BaseProxyService(ABC):
         # 候选序列
         if config_override:
             candidates_round1 = [config_override]
+            no_healthy_candidates = False
         elif lb_mode == 'weight-based':
             candidates_round1 = self._get_candidate_order(configs)
+            no_healthy_candidates = (len(candidates_round1) == 0)
         else:
             # active-first: 维持原有行为
             try:
@@ -1059,7 +1062,9 @@ class BaseProxyService(ABC):
             return res1
 
         # 第一轮全部失败：根据选项判断是否自动重置并进行第二轮
+        reset_triggered = False
         if auto_reset_enabled and self._reset_lb_service_failures():
+            reset_triggered = True
             # 广播重置事件
             with self._lb_lock:
                 self._ensure_lb_config_current_locked()
@@ -1077,6 +1082,65 @@ class BaseProxyService(ABC):
             ok2, res2 = await run_round(candidates_round2, 2)
             if ok2:
                 return res2
+
+        # 如无健康候选且未触发自动重置，发送耗尽事件并返回更明确的错误
+        if lb_mode == 'weight-based' and no_healthy_candidates and not reset_triggered:
+            with self._lb_lock:
+                self._ensure_lb_config_current_locked()
+                svc_section = self.lb_config['services'][self.service_name]
+                options = self.lb_config.get('options', {})
+                threshold_value = int(svc_section.get('failureThreshold', 3) or 3)
+                cooldown = int(options.get('resetCooldownSeconds', 30) or 30)
+                last_reset = float(svc_section.get('lastResetAt', 0) or 0)
+            now = time.time()
+            remaining = int(max(0, cooldown - (now - last_reset)))
+            if not started_event_sent[0]:
+                await self.realtime_hub.request_started(
+                    request_id=request_id,
+                    method=request.method,
+                    path=path,
+                    channel="unassigned",
+                    headers={},
+                    target_url=None
+                )
+                started_event_sent[0] = True
+            await self.realtime_hub.lb_exhausted(
+                request_id=request_id,
+                reason='no_healthy_candidates',
+                total_configs=len(configs),
+                threshold=threshold_value,
+                cooldown_seconds=cooldown,
+                cooldown_remaining_seconds=remaining,
+            )
+            duration_ms = int((time.time() - start_time) * 1000)
+            await self.realtime_hub.request_completed(
+                request_id=request_id,
+                status_code=503,
+                duration_ms=duration_ms,
+                success=False
+            )
+            # 记录失败（不含响应体）
+            await self.log_request(
+                method=request.method,
+                path=path,
+                status_code=503,
+                duration_ms=duration_ms,
+                target_headers=None,
+                filtered_body=None,
+                original_headers=original_headers,
+                original_body=original_body,
+                channel=None,
+                target_url=None
+            )
+            return JSONResponse({
+                "error": "NO_HEALTHY_UPSTREAM",
+                "message": "无健康上游可用：所有候选均已达到失败阈值或被暂时跳过",
+                "service": self.service_name,
+                "threshold": threshold_value,
+                "auto_reset": auto_reset_enabled,
+                "reset_cooldown_seconds": cooldown,
+                "cooldown_remaining_seconds": remaining
+            }, status_code=503)
 
         # 未开启自动重置 或 第二轮仍失败 → 返回最后错误
         duration_ms = int((time.time() - start_time) * 1000)

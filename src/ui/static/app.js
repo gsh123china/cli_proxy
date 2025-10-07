@@ -2101,6 +2101,19 @@ const app = createApp({
                             loadLoadbalanceConfig().catch(() => {});
                         }
                         break;
+                    case 'lb_exhausted':
+                        if (loadbalanceOptions.notifyEnabled) {
+                            const remaining = Number(event.cooldown_remaining_seconds ?? 0);
+                            const msg = `服务 [${event.service}] 无可用上游：所有候选达到失败阈值 ${event.threshold}。` +
+                                (remaining > 0
+                                    ? ` 冷却剩余约 ${remaining} 秒，可手动重置或等待自动重置。`
+                                    : ' 可手动重置或等待自动重置。');
+                            ElMessage.error({ message: msg, duration: 4000, showClose: true });
+                        }
+                        if (isLoadbalanceWeightMode.value) {
+                            loadLoadbalanceConfig().catch(() => {});
+                        }
+                        break;
                     case 'connection':
                         connectionStatus[event.service] = event.status === 'connected';
                         if (event.status === 'connected') {
