@@ -202,6 +202,7 @@ class BaseProxyService(ABC):
         def _write_log():
             try:
                 log_entry = {
+                    'id': str(uuid.uuid4()),
                     'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
                     'service': self.service_name,
                     'method': method,

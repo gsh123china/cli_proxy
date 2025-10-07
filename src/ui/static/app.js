@@ -53,6 +53,9 @@ const app = createApp({
         const headerFilterDrawerVisible = ref(false);    // Header Filter（新增）
         const logDetailVisible = ref(false);
         const allLogsVisible = ref(false);
+        const logDetailLoading = ref(false);
+        const logDetailError = ref(null);
+        const logDetailRequestId = ref(null);
         const activeConfigTab = ref('claude');
         const activeLogTab = ref('basic'); // 日志详情Tab状态
         
@@ -1907,24 +1910,72 @@ const app = createApp({
             }
         };
 
-        const showLogDetail = (log) => {
-            selectedLog.value = log;
-            activeLogTab.value = 'basic'; // 重置到基本信息tab
-            logDetailVisible.value = true;
+        const decodeContentAsync = (encodedContent, targetRef) => {
+            targetRef.value = '';
+            if (!encodedContent) {
+                return;
+            }
+            setTimeout(() => {
+                targetRef.value = decodeBodyContent(encodedContent);
+            }, 0);
+        };
 
-            decodedRequestBody.value = decodeBodyContent(log.filtered_body);
-            decodedOriginalRequestBody.value = decodeBodyContent(log.original_body);
-            decodedResponseContent.value = decodeBodyContent(log.response_content);
+        const showLogDetail = (log) => {
+            if (!log || !log.id) {
+                ElMessage.error('无法加载日志详情：缺少日志ID');
+                return;
+            }
+
+            // 打开抽屉并清空旧内容
+            logDetailVisible.value = true;
+            activeLogTab.value = 'basic';
+            logDetailError.value = null;
+            logDetailLoading.value = true;
+            logDetailRequestId.value = log.id;
+            selectedLog.value = { ...log };
+            decodedRequestBody.value = '';
+            decodedOriginalRequestBody.value = '';
+            decodedResponseContent.value = '';
+
+            fetchWithErrorHandling(`/api/logs/${encodeURIComponent(log.id)}`)
+                .then((detail) => {
+                    if (logDetailRequestId.value !== log.id) {
+                        return;
+                    }
+                    selectedLog.value = detail;
+                    decodeContentAsync(detail.filtered_body, decodedRequestBody);
+                    decodeContentAsync(detail.original_body, decodedOriginalRequestBody);
+                    decodeContentAsync(detail.response_content, decodedResponseContent);
+                })
+                .catch((error) => {
+                    if (logDetailRequestId.value !== log.id) {
+                        return;
+                    }
+                    logDetailError.value = error.message;
+                    ElMessage.error('获取日志详情失败: ' + error.message);
+                })
+                .finally(() => {
+                    if (logDetailRequestId.value === log.id) {
+                        logDetailLoading.value = false;
+                    }
+                });
         };
         
         // 加载所有日志（默认只显示最近100条）
-        const loadAllLogs = async () => {
+        const ALL_LOGS_CACHE_TTL = 5000;
+        let lastAllLogsFetchAt = 0;
+
+        const loadAllLogs = async (force = false) => {
+            const now = Date.now();
+            if (!force && allLogs.value.length > 0 && (now - lastAllLogsFetchAt) < ALL_LOGS_CACHE_TTL) {
+                return;
+            }
             allLogsLoading.value = true;
             try {
                 const data = await fetchWithErrorHandling('/api/logs/all');
                 const logs = Array.isArray(data) ? data : [];
-                // 只保留最近100条记录
-                allLogs.value = logs.slice(0, 100);
+                allLogs.value = logs;
+                lastAllLogsFetchAt = Date.now();
             } catch (error) {
                 ElMessage.error('获取所有日志失败: ' + error.message);
                 allLogs.value = [];
@@ -1934,14 +1985,14 @@ const app = createApp({
         };
         
         // 查看所有日志
-        const viewAllLogs = async () => {
+        const viewAllLogs = () => {
             allLogsVisible.value = true;
-            await loadAllLogs();
+            loadAllLogs();
         };
         
         // 刷新所有日志
         const refreshAllLogs = () => {
-            loadAllLogs();
+            loadAllLogs(true);
         };
         
         // 格式化请求体JSON
@@ -2308,6 +2359,8 @@ const app = createApp({
             bodyFilterDrawerVisible,        // 重命名
             headerFilterDrawerVisible,      // 新增
             logDetailVisible,
+            logDetailLoading,
+            logDetailError,
             allLogsVisible,
             activeConfigTab,
             activeLogTab,

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import webbrowser
 import time
 from pathlib import Path
@@ -449,6 +450,16 @@ def _apply_channel_renames(service: str, rename_map: Dict[str, str]) -> None:
     _sync_loadbalance_config_names(service, rename_map)
 
 
+def _compute_log_id(entry: Dict[str, Any], raw_line: str, index: int) -> str:
+    """Ensure a log entry has a stable identifier for UI lookups."""
+    existing = entry.get('id')
+    if isinstance(existing, str) and existing:
+        return existing
+
+    digest = hashlib.md5(raw_line.encode('utf-8')).hexdigest()
+    return f'legacy-{digest}-{index}'
+
+
 def load_logs() -> list[Dict[str, Any]]:
     logs: list[Dict[str, Any]] = []
     log_path = LOG_FILE if LOG_FILE.exists() else (
@@ -458,7 +469,7 @@ def load_logs() -> list[Dict[str, Any]]:
         return logs
 
     with open(log_path, 'r', encoding='utf-8') as f:
-        for raw_line in f:
+        for index, raw_line in enumerate(f):
             line = raw_line.strip()
             if not line:
                 continue
@@ -467,8 +478,25 @@ def load_logs() -> list[Dict[str, Any]]:
                 continue
             service = entry.get('service') or entry.get('usage', {}).get('service') or 'unknown'
             entry['usage'] = normalize_usage_record(service, entry.get('usage'))
+            entry['id'] = _compute_log_id(entry, raw_line, index)
             logs.append(entry)
     return logs
+
+
+def build_log_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a lightweight projection of a log entry for list views."""
+    return {
+        'id': entry.get('id'),
+        'timestamp': entry.get('timestamp'),
+        'service': entry.get('service'),
+        'channel': entry.get('channel'),
+        'method': entry.get('method'),
+        'path': entry.get('path'),
+        'status_code': entry.get('status_code'),
+        'duration_ms': entry.get('duration_ms'),
+        'usage': entry.get('usage'),
+        'response_truncated': entry.get('response_truncated', False),
+    }
 
 
 def load_history_usage() -> Dict[str, Dict[str, Dict[str, int]]]:
@@ -928,7 +956,22 @@ def get_all_logs():
     """获取所有请求日志"""
     try:
         logs = load_logs()
-        return jsonify(logs[::-1])
+        summaries = [build_log_summary(entry) for entry in logs]
+        summaries.reverse()
+        return jsonify(summaries[:100])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/logs/<log_id>')
+def get_log_detail(log_id: str):
+    """按ID获取单条请求日志详情"""
+    try:
+        logs = load_logs()
+        for entry in reversed(logs):
+            if entry.get('id') == log_id:
+                return jsonify(entry)
+        return jsonify({'error': 'Log not found'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

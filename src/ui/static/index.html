@@ -952,7 +952,16 @@
             size="900px"
             class="log-detail-drawer">
             
-            <div v-if="selectedLog" class="log-detail-content">
+            <div v-if="selectedLog" class="log-detail-content" v-loading="logDetailLoading">
+                <el-alert
+                    v-if="logDetailError"
+                    type="error"
+                    :closable="false"
+                    style="margin-bottom: 16px;"
+                    title="日志详情加载失败"
+                    :description="logDetailError">
+                </el-alert>
+
                 <!-- Tab切换导航 -->
                 <el-tabs v-model="activeLogTab" class="log-detail-tabs">
                     <!-- 基本信息Tab -->
