@@ -661,6 +661,10 @@ class BaseProxyService(ABC):
 
         # 预加载配置列表，减少重复 I/O
         configs = self.config_manager.configs
+        if not configs:
+            raise ValueError(
+                f"{self.service_name} 当前没有启用的上游配置，请在 ~/.clp/{self.service_name}.json 中取消禁用或新增配置"
+            )
 
         # 确定要使用的配置
         if config_override:

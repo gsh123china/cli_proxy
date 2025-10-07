@@ -1,11 +1,11 @@
 import json
 import webbrowser
 import time
-import json
 from pathlib import Path
 from typing import Any, Dict
 from flask import Flask, jsonify, send_file, request
 import os
+from datetime import datetime, timezone
 
 from src.utils.usage_parser import (
     METRIC_KEYS,
@@ -108,6 +108,38 @@ def _detect_config_renames(old_configs: Dict[str, Any], new_configs: Dict[str, A
                 rename_map[old_name] = new_name
 
     return rename_map
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(value)
+
+
+def _current_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+
+def _normalize_deleted_flags(configs: Dict[str, Any]) -> None:
+    if not isinstance(configs, dict):
+        return
+    for cfg in configs.values():
+        if not isinstance(cfg, dict):
+            continue
+        deleted = _coerce_bool(cfg.get('deleted', False))
+        if deleted:
+            cfg['deleted'] = True
+            cfg['active'] = False
+            deleted_at = cfg.get('deleted_at')
+            if not isinstance(deleted_at, str) or not deleted_at.strip():
+                cfg['deleted_at'] = _current_utc_iso()
+        else:
+            cfg.pop('deleted', None)
+            cfg.pop('deleted_at', None)
 
 
 def _rename_history_channels(service: str, rename_map: Dict[str, str]) -> None:
@@ -355,6 +387,57 @@ def _cleanup_loadbalance_config_references(service: str, deleted_configs: set) -
 
     except Exception as e:
         print(f"清理负载均衡配置引用失败: {e}")
+
+
+def _cleanup_loadbalance_for_deleted(service: str, configs: Dict[str, Any]) -> None:
+    """清理负载均衡中对逻辑删除配置的引用（currentFailures/excludedConfigs）"""
+    lb_config_file = DATA_DIR / 'lb_config.json'
+    if not lb_config_file.exists():
+        return
+
+    try:
+        deleted_names = {
+            name for name, cfg in (configs or {}).items()
+            if isinstance(cfg, dict) and bool(cfg.get('deleted'))
+        }
+        if not deleted_names:
+            return
+
+        _cleanup_loadbalance_for_names(service, deleted_names)
+    except Exception as e:
+        print(f"清理负载均衡逻辑删除引用失败: {e}")
+
+
+def _cleanup_loadbalance_for_names(service: str, names: set[str]) -> None:
+    lb_config_file = DATA_DIR / 'lb_config.json'
+    if not lb_config_file.exists() or not names:
+        return
+    try:
+        with open(lb_config_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        services = data.get('services', {})
+        service_config = services.get(service, {})
+        if not service_config:
+            return
+        changed = False
+        current_failures = service_config.get('currentFailures', {}) or {}
+        for name in list(current_failures.keys()):
+            if name in names:
+                current_failures.pop(name, None)
+                changed = True
+        if changed:
+            service_config['currentFailures'] = current_failures
+        excluded_configs = service_config.get('excludedConfigs', []) or []
+        filtered_excluded = [n for n in excluded_configs if n not in names]
+        if len(filtered_excluded) != len(excluded_configs):
+            service_config['excludedConfigs'] = filtered_excluded
+            changed = True
+        if changed:
+            data.setdefault('services', {})[service] = service_config
+            with open(lb_config_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _apply_channel_renames(service: str, rename_map: Dict[str, str]) -> None:
@@ -648,6 +731,12 @@ def save_config(service):
         except json.JSONDecodeError as e:
             return jsonify({'error': f'Invalid JSON format: {str(e)}'}), 400
 
+        if not isinstance(new_configs, dict):
+            return jsonify({'error': '配置文件必须是对象类型'}), 400
+
+        _normalize_deleted_flags(new_configs)
+        normalized_content = json.dumps(new_configs, ensure_ascii=False, indent=2)
+
         config_file = Path.home() / '.clp' / f'{service}.json'
         old_content = None
         old_configs: Dict[str, Any] = {}
@@ -665,10 +754,25 @@ def save_config(service):
         try:
             # 直接写入新内容
             with open(config_file, 'w', encoding='utf-8') as f:
-                f.write(content)
+                f.write(normalized_content)
 
             _apply_channel_renames(service, rename_map)
             _cleanup_deleted_configs(service, old_configs, new_configs)
+
+            # 逻辑删除清理负载均衡引用
+            _cleanup_loadbalance_for_deleted(service, new_configs)
+
+            # 复原启用（从 deleted=true -> false）的配置也清理负载均衡历史
+            reenabled = set()
+            for name, old_cfg in (old_configs or {}).items():
+                new_cfg = (new_configs or {}).get(name, {})
+                if isinstance(old_cfg, dict) and isinstance(new_cfg, dict):
+                    old_del = _coerce_bool(old_cfg.get('deleted', False))
+                    new_del = _coerce_bool(new_cfg.get('deleted', False))
+                    if old_del and not new_del:
+                        reenabled.add(name)
+            if reenabled:
+                _cleanup_loadbalance_for_names(service, reenabled)
         except Exception as exc:
             # 恢复旧配置，避免部分成功
             if old_content is not None:

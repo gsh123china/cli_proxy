@@ -1241,6 +1241,25 @@ header h1 {
     font-weight: 500;
 }
 
+.site-deleted {
+    border-color: #f56c6c;
+    background: #fef0f0;
+    opacity: 0.85;
+}
+
+.site-deleted::before {
+    content: "已禁用";
+    position: absolute;
+    top: -12px;
+    right: 16px;
+    background: #f56c6c;
+    color: white;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
 /* 配置字段布局 */
 .config-field {
     display: flex;
@@ -1269,6 +1288,11 @@ header h1 {
     display: flex;
     gap: 8px;
     margin-left: auto;
+}
+
+.deleted-at-note {
+    color: #909399;
+    font-size: 12px;
 }
 
 /* 配置帮助信息 */

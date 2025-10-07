@@ -9,6 +9,16 @@ import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
+def _as_bool(value: Any) -> bool:
+    """宽松解析布尔值"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(value)
+
 class CachedConfigManager:
     """带缓存的配置管理器"""
     
@@ -26,7 +36,8 @@ class CachedConfigManager:
         self.config_file = self.config_dir / f'{service_name}.json'
         
         # 缓存相关
-        self._configs_cache = {}
+        self._configs_cache: Dict[str, Dict[str, Any]] = {}
+        self._all_configs_cache: Dict[str, Dict[str, Any]] = {}
         self._active_config_cache = None
         self._cache_time = 0
         self._file_mtime = 0
@@ -70,58 +81,73 @@ class CachedConfigManager:
             # 文件不存在或无法访问，需要重新加载
             return True
     
-    def _load_configs_from_file(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    def _load_configs_from_file(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str], Dict[str, Dict[str, Any]]]:
         """从文件加载配置（内部方法）"""
         created_new = self._ensure_config_file()
         if created_new:
-            return {}, None
+            return {}, None, {}
             
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 
             configs = {}
+            all_configs: Dict[str, Dict[str, Any]] = {}
             active_config = None
             
             # 解析配置格式
             for config_name, config_data in data.items():
                 if 'base_url' in config_data and 'auth_token' in config_data:
-                    configs[config_name] = {
-                        'base_url': config_data['base_url'],
-                        'auth_token': config_data['auth_token']
-                    }
-                    # 如果存在 api_key，也保留它
-                    if 'api_key' in config_data:
-                        configs[config_name]['api_key'] = config_data['api_key']
-
-                    # 解析权重
                     weight_value = config_data.get('weight', 0)
                     try:
                         weight_value = float(weight_value)
                     except (TypeError, ValueError):
                         weight_value = 0
-                    configs[config_name]['weight'] = weight_value
+
+                    deleted_flag = _as_bool(config_data.get('deleted', False))
+                    deleted_at = config_data.get('deleted_at')
+                    if deleted_flag and not isinstance(deleted_at, str):
+                        deleted_at = None
+
+                    parsed_config: Dict[str, Any] = {
+                        'base_url': config_data['base_url'],
+                        'auth_token': config_data['auth_token'],
+                        'weight': weight_value,
+                        'deleted': deleted_flag,
+                        'deleted_at': deleted_at,
+                        'active': _as_bool(config_data.get('active', False)) and not deleted_flag
+                    }
+                    # 如果存在 api_key，也保留它
+                    if 'api_key' in config_data:
+                        parsed_config['api_key'] = config_data['api_key']
+
+                    all_configs[config_name] = parsed_config
+                    if deleted_flag:
+                        continue
+
+                    configs[config_name] = parsed_config
                     
                     # 检查是否为激活配置
-                    if config_data.get('active', False):
+                    if not deleted_flag and config_data.get('active', False):
                         active_config = config_name
                         
         except (json.JSONDecodeError, OSError) as e:
             print(f"配置文件加载失败: {e}")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump({}, f, ensure_ascii=False, indent=2)
-            return {}, None
+            return {}, None, {}
             
         # 如果没有激活配置，使用第一个
         if not active_config and configs:
             active_config = list(configs.keys())[0]
             
-        return configs, active_config
+        return configs, active_config, all_configs
     
     def _refresh_cache(self):
         """刷新缓存（内部方法）"""
-        configs, active_config = self._load_configs_from_file()
+        configs, active_config, all_configs = self._load_configs_from_file()
         self._configs_cache = configs
+        self._all_configs_cache = all_configs
         self._active_config_cache = active_config
         self._cache_time = time.time()
         
@@ -131,17 +157,23 @@ class CachedConfigManager:
         except (OSError, FileNotFoundError):
             self._file_mtime = 0
     
-    def _get_cached_data(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    def _get_cached_data(self, include_deleted: bool = False) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
         """获取缓存的配置数据"""
         with self._lock:
             if self._should_reload():
                 self._refresh_cache()
-            return self._configs_cache.copy(), self._active_config_cache
+            cache = self._all_configs_cache if include_deleted else self._configs_cache
+            return {name: cfg.copy() for name, cfg in cache.items()}, self._active_config_cache
     
     @property
     def configs(self) -> Dict[str, Dict[str, Any]]:
         """获取所有配置（使用缓存）"""
         configs, _ = self._get_cached_data()
+        return configs
+
+    def get_all_configs(self) -> Dict[str, Dict[str, Any]]:
+        """返回包含逻辑删除项在内的配置副本"""
+        configs, _ = self._get_cached_data(include_deleted=True)
         return configs
     
     @property
@@ -163,7 +195,9 @@ class CachedConfigManager:
                 return False
             
             try:
-                self._save_configs(self._configs_cache, config_name)
+                for name, cfg in self._all_configs_cache.items():
+                    cfg['active'] = (name == config_name) and not cfg.get('deleted', False)
+                self._save_configs(self._all_configs_cache, config_name)
                 # 保存成功后立即刷新缓存
                 self._refresh_cache()
                 return True
@@ -173,9 +207,6 @@ class CachedConfigManager:
     
     def _save_configs(self, configs: Dict[str, Dict[str, Any]], active_config: str):
         """保存配置到文件"""
-        if not configs:
-            return
-            
         self._ensure_config_dir()
         
         # 构建要保存的数据
@@ -183,8 +214,8 @@ class CachedConfigManager:
         for name, config in configs.items():
             data[name] = {
                 'base_url': config['base_url'],
-                'auth_token': config['auth_token'],
-                'active': name == active_config
+                'auth_token': config.get('auth_token', ''),
+                'active': (name == active_config) and not config.get('deleted', False)
             }
             # 如果存在 api_key，也保存它
             if 'api_key' in config:
@@ -192,6 +223,13 @@ class CachedConfigManager:
 
             if 'weight' in config:
                 data[name]['weight'] = config['weight']
+
+            if config.get('deleted', False):
+                data[name]['deleted'] = True
+                if config.get('deleted_at'):
+                    data[name]['deleted_at'] = config['deleted_at']
+            else:
+                data[name].pop('deleted_at', None)
         
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:

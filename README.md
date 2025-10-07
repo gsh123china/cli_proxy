@@ -140,11 +140,21 @@ clp list claude
 # 列出Codex的所有配置
 clp list codex
 
+# 包含已禁用的配置
+clp list claude --include-deleted
+
 # 激活Claude的prod配置
 clp active claude prod
 
 # 激活Codex的dev配置
 clp active codex dev
+
+# 禁用配置（逻辑删除）
+clp disable codex backup
+
+# 恢复已禁用配置
+clp enable claude backup
+
 ```
 
 ### claude 使用方法
@@ -919,6 +929,32 @@ python -m build
 - `~/.clp/codex.json` - Codex服务配置
 - `~/.clp/run/` - 运行时文件（PID、日志）
 - `~/.clp/data/` - 数据文件（请求日志、统计数据）
+
+> 说明：逻辑删除（deleted=true）的配置不会参与路由与负载均衡；禁用时系统会从负载均衡状态中清理该配置的失败计数与排除列表。
+
+#### 配置字段示例
+
+```json
+{
+  "prod": {
+    "base_url": "https://api.example.com",
+    "auth_token": "token-prod",
+    "weight": 100,
+    "active": true
+  },
+  "backup": {
+    "base_url": "https://backup.example.com",
+    "auth_token": "token-backup",
+    "weight": 50,
+    "deleted": true,
+    "deleted_at": "2025-10-07T03:25:00Z"
+  }
+}
+```
+
+- `deleted`: 设置为 `true` 表示逻辑删除，配置不会用于请求转发，可通过 UI 或 `clp enable` 恢复。
+- `deleted_at`: 记录禁用时间（ISO8601），禁用时自动写入，恢复启用后可留空。
+- 未显式声明 `deleted` 字段的旧配置默认视为启用，无需手动迁移。
 
 ### 添加新的AI服务
 

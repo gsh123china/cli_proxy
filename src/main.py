@@ -119,6 +119,31 @@ def main():
     )
     lists.add_argument('service', choices=['codex', 'claude'], 
                       help='服务类型', metavar='{codex,claude}')
+    lists.add_argument('--include-deleted', action='store_true', help='同时显示已禁用的配置')
+
+    # disable 命令
+    disable_parser = subparsers.add_parser(
+        'disable',
+        help='禁用指定配置',
+        description='将指定配置标记为逻辑删除（禁用）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  clp disable claude backup         禁用 Claude 的 backup 配置"""
+    )
+    disable_parser.add_argument('service', choices=['codex', 'claude'], help='服务类型', metavar='{codex,claude}')
+    disable_parser.add_argument('config_name', help='要禁用的配置名称')
+
+    # enable 命令
+    enable_parser = subparsers.add_parser(
+        'enable',
+        help='启用被禁用的配置',
+        description='恢复已逻辑删除的配置',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  clp enable codex backup          启用 Codex 的 backup 配置"""
+    )
+    enable_parser.add_argument('service', choices=['codex', 'claude'], help='服务类型', metavar='{codex,claude}')
+    enable_parser.add_argument('config_name', help='要启用的配置名称')
     
     # status 命令
     status_parser = subparsers.add_parser(
@@ -248,9 +273,19 @@ def main():
             claude.set_active_config(args.config_name)
     elif args.command == 'list':
         if args.service == 'codex':
-            codex.list_configs()
+            codex.list_configs(include_deleted=args.include_deleted)
         elif args.service == 'claude':
-            claude.list_configs()
+            claude.list_configs(include_deleted=args.include_deleted)
+    elif args.command == 'disable':
+        if args.service == 'codex':
+            codex.disable_config(args.config_name)
+        elif args.service == 'claude':
+            claude.disable_config(args.config_name)
+    elif args.command == 'enable':
+        if args.service == 'codex':
+            codex.enable_config(args.config_name)
+        elif args.service == 'claude':
+            claude.enable_config(args.config_name)
     elif args.command == 'status':
         print_status()
     elif args.command == 'ui':

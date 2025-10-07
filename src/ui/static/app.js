@@ -72,12 +72,14 @@ const app = createApp({
 
         // 友好表单的配置数据
         const friendlyConfigs = reactive({
-            claude: [],  // [{ name, baseUrl, authType, authValue, active }]
+            // 结构：{ name, baseUrl, authType, authValue, active, weight, deleted, deletedAt }
+            claude: [],
             codex: []
         });
 
         // 配置编辑模式 'interactive' | 'json'
         const configEditMode = ref('interactive');
+
 
         // 新增站点编辑状态
         const editingNewSite = reactive({
@@ -93,7 +95,9 @@ const app = createApp({
                 authType: 'auth_token',
                 authValue: '',
                 active: false,
-                weight: 0
+                weight: 0,
+                deleted: false,
+                deletedAt: null
             },
             codex: {
                 name: '',
@@ -101,7 +105,9 @@ const app = createApp({
                 authType: 'auth_token',
                 authValue: '',
                 active: false,
-                weight: 0
+                weight: 0,
+                deleted: false,
+                deletedAt: null
             }
         });
 
@@ -961,12 +967,14 @@ const app = createApp({
                 const threshold = loadbalanceConfig.services[service]?.failureThreshold || 3;
                 const failures = loadbalanceConfig.services[service]?.currentFailures || {};
                 const excluded = loadbalanceConfig.services[service]?.excludedConfigs || [];
-                const list = Object.entries(metadata).map(([name, meta]) => {
-                    const weight = Number(meta?.weight ?? 0);
-                    return {
-                        name,
-                        weight: Number.isFinite(weight) ? weight : 0,
-                        failures: failures[name] || 0,
+                const list = Object.entries(metadata)
+                    .filter(([, meta]) => !meta?.deleted)
+                    .map(([name, meta]) => {
+                        const weight = Number(meta?.weight ?? 0);
+                        return {
+                            name,
+                            weight: Number.isFinite(weight) ? weight : 0,
+                            failures: failures[name] || 0,
                         threshold,
                         excluded: excluded.includes(name),
                         isActive: services[service].config === name
@@ -1172,15 +1180,23 @@ const app = createApp({
                 if (claudeData.content) {
                     const configs = JSON.parse(claudeData.content);
                     const entries = Object.entries(configs).filter(([key, value]) => key && key !== 'undefined' && value !== undefined);
-                    claudeConfigs.value = entries.map(([key]) => key);
                     const metadata = {};
+                    const available = [];
                     entries.forEach(([key, value]) => {
                         const weightValue = Number(value?.weight ?? 0);
+                        const deleted = !!value?.deleted;
+                        const deletedAt = typeof value?.deleted_at === 'string' ? value.deleted_at : null;
                         metadata[key] = {
                             weight: Number.isFinite(weightValue) ? weightValue : 0,
-                            active: !!value?.active
+                            active: !deleted && !!value?.active,
+                            deleted,
+                            deletedAt
                         };
+                        if (!deleted) {
+                            available.push(key);
+                        }
                     });
+                    claudeConfigs.value = available;
                     configMetadata.claude = metadata;
                 } else {
                     claudeConfigs.value = [];
@@ -1192,15 +1208,23 @@ const app = createApp({
                 if (codexData.content) {
                     const configs = JSON.parse(codexData.content);
                     const entries = Object.entries(configs).filter(([key, value]) => key && key !== 'undefined' && value !== undefined);
-                    codexConfigs.value = entries.map(([key]) => key);
                     const metadata = {};
+                    const available = [];
                     entries.forEach(([key, value]) => {
                         const weightValue = Number(value?.weight ?? 0);
+                        const deleted = !!value?.deleted;
+                        const deletedAt = typeof value?.deleted_at === 'string' ? value.deleted_at : null;
                         metadata[key] = {
                             weight: Number.isFinite(weightValue) ? weightValue : 0,
-                            active: !!value?.active
+                            active: !deleted && !!value?.active,
+                            deleted,
+                            deletedAt
                         };
+                        if (!deleted) {
+                            available.push(key);
+                        }
                     });
+                    codexConfigs.value = available;
                     configMetadata.codex = metadata;
                 } else {
                     codexConfigs.value = [];
@@ -1322,7 +1346,9 @@ const app = createApp({
                 authType: 'auth_token',
                 authValue: '',
                 active: false,
-                weight: 0
+                weight: 0,
+                deleted: false,
+                deletedAt: null
             };
             // 自动聚焦到站点名称输入框
             nextTick(() => {
@@ -1340,6 +1366,16 @@ const app = createApp({
                     friendlyConfigs[service].forEach(site => {
                         site.active = false;
                     });
+                    newSiteData[service].deleted = false;
+                    newSiteData[service].deletedAt = null;
+                }
+                if (newSiteData[service].deleted) {
+                    newSiteData[service].active = false;
+                    if (!newSiteData[service].deletedAt) {
+                        newSiteData[service].deletedAt = new Date().toISOString();
+                    }
+                } else {
+                    newSiteData[service].deletedAt = null;
                 }
                 // 插入到第一个位置
                 friendlyConfigs[service].unshift({...newSiteData[service]});
@@ -1359,7 +1395,9 @@ const app = createApp({
                 authType: 'auth_token',
                 authValue: '',
                 active: false,
-                weight: 0
+                weight: 0,
+                deleted: false,
+                deletedAt: null
             };
         };
 
@@ -1396,15 +1434,44 @@ const app = createApp({
 
         // 处理激活状态变化（单选逻辑）
         const handleActiveChange = (service, activeIndex, newValue) => {
-            if (newValue) {
-                // 如果激活当前站点，关闭其他站点
+            const targetSite = friendlyConfigs[service][activeIndex];
+            if (newValue && targetSite) {
+                targetSite.deleted = false;
+                targetSite.deletedAt = null;
                 friendlyConfigs[service].forEach((site, index) => {
                     if (index !== activeIndex) {
                         site.active = false;
+                    } else {
+                        site.active = true;
                     }
                 });
             }
             syncFormToJson(service);
+        };
+
+        const handleDeletedChange = (service, index, newValue) => {
+            const site = friendlyConfigs[service][index];
+            if (!site) return;
+            site.deleted = !!newValue;
+            if (site.deleted) {
+                site.active = false;
+                site.deletedAt = new Date().toISOString();
+            } else {
+                site.deletedAt = null;
+            }
+            syncFormToJson(service);
+        };
+
+        const handleNewSiteDeletedChange = (service, newValue) => {
+            const siteDraft = newSiteData[service];
+            if (!siteDraft) return;
+            siteDraft.deleted = !!newValue;
+            if (siteDraft.deleted) {
+                siteDraft.active = false;
+                siteDraft.deletedAt = new Date().toISOString();
+            } else {
+                siteDraft.deletedAt = null;
+            }
         };
 
         // 从表单同步到JSON
@@ -1432,6 +1499,19 @@ const app = createApp({
 
                         const weightValue = Number(site.weight ?? 0);
                         config.weight = Number.isFinite(weightValue) ? weightValue : 0;
+
+                        const isDeleted = !!site.deleted;
+                        config.deleted = isDeleted;
+                        if (isDeleted) {
+                            const timestamp = (typeof site.deletedAt === 'string' && site.deletedAt)
+                                ? site.deletedAt
+                                : new Date().toISOString();
+                            config.deleted_at = timestamp;
+                            site.deletedAt = timestamp;
+                            config.active = false;
+                        } else {
+                            site.deletedAt = null;
+                        }
 
                         jsonObj[site.name.trim()] = config;
                     }
@@ -1482,13 +1562,19 @@ const app = createApp({
                             weightValue = 0;
                         }
 
+                        const deleted = !!config.deleted;
+                        const deletedAt = typeof config.deleted_at === 'string' ? config.deleted_at : null;
+                        const activeValue = deleted ? false : !!config.active;
+
                         sites.push({
                             name: siteName,
                             baseUrl: config.base_url || '',
                             authType: authType,
                             authValue: authValue,
-                            active: config.active || false,
-                            weight: weightValue
+                            active: activeValue,
+                            weight: weightValue,
+                            deleted,
+                            deletedAt
                         });
                     }
                 });
@@ -2288,6 +2374,8 @@ const app = createApp({
             saveInteractiveConfig,
             removeConfigSite,
             handleActiveChange,
+            handleDeletedChange,
+            handleNewSiteDeletedChange,
             syncFormToJson,
             syncJsonToForm,
             getModelOptions,

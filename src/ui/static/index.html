@@ -380,7 +380,10 @@
                                     <div class="config-field">
                                         <label class="field-label">激活状态:</label>
                                         <div class="field-control">
-                                            <el-switch v-model="newSiteData.claude.active"></el-switch>
+                                            <el-switch
+                                                v-model="newSiteData.claude.active"
+                                                :disabled="newSiteData.claude.deleted">
+                                            </el-switch>
                                             <div class="config-actions-inline">
                                                 <el-button @click="cancelAddSite('claude')" size="small">取消</el-button>
                                                 <el-button type="primary" @click="confirmAddSite('claude')" size="small">确认</el-button>
@@ -388,11 +391,23 @@
                                             </div>
                                         </div>
                                     </div>
+                                    <div class="config-field">
+                                        <label class="field-label">禁用（逻辑删除）:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="newSiteData.claude.deleted"
+                                                @change="handleNewSiteDeletedChange('claude', $event)">
+                                            </el-switch>
+                                            <span v-if="newSiteData.claude.deleted && newSiteData.claude.deletedAt" class="deleted-at-note">
+                                                禁用于 {{ newSiteData.claude.deletedAt }}
+                                            </span>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <!-- 现有站点列表 -->
                                 <div v-for="(site, index) in friendlyConfigs.claude" :key="index"
-                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                     :class="['config-site-card', { 'site-active': (site && site.active), 'site-deleted': (site && site.deleted) }]">
                                     <div class="config-field">
                                         <label class="field-label">站点名称:</label>
                                         <el-input
@@ -443,6 +458,7 @@
                                         <div class="field-control">
                                             <el-switch
                                                 v-model="site.active"
+                                                :disabled="!!(site && site.deleted)"
                                                 @change="handleActiveChange('claude', index, $event)">
                                             </el-switch>
                                             <div class="config-actions-inline">
@@ -454,12 +470,26 @@
                                                 </el-button>
                                                 <el-button
                                                     @click="testSiteConnection('claude', index)"
+                                                    :disabled="!!(site && site.deleted)"
                                                     type="info"
                                                     size="small"
                                                     plain>
                                                     测试
                                                 </el-button>
                                             </div>
+                                        </div>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">禁用（逻辑删除）:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="site.deleted"
+                                                @change="handleDeletedChange('claude', index, $event)">
+                                            </el-switch>
+                                            <el-tag v-if="site && site.deleted" type="warning" size="small">已禁用</el-tag>
+                                            <span v-if="site && site.deleted && site.deletedAt" class="deleted-at-note">
+                                                禁用于 {{ site.deletedAt }}
+                                            </span>
                                         </div>
                                     </div>
                                 </div>
@@ -487,7 +517,10 @@
     "base_url": "目标站点地址",
     "auth_token": "令牌",
     "api_key": "有些站点使用x-api-key传递就放这里",
-    "active": false
+    "weight": 0,
+    "active": false,
+    "deleted": false,
+    "deleted_at": null
   }
 }</code>
                             </div>
@@ -587,7 +620,10 @@
                                     <div class="config-field">
                                         <label class="field-label">激活状态:</label>
                                         <div class="field-control">
-                                            <el-switch v-model="newSiteData.codex.active"></el-switch>
+                                            <el-switch
+                                                v-model="newSiteData.codex.active"
+                                                :disabled="newSiteData.codex.deleted">
+                                            </el-switch>
                                             <div class="config-actions-inline">
                                                 <el-button @click="cancelAddSite('codex')" size="small">取消</el-button>
                                                 <el-button type="primary" @click="confirmAddSite('codex')" size="small">确认</el-button>
@@ -595,11 +631,23 @@
                                             </div>
                                         </div>
                                     </div>
+                                    <div class="config-field">
+                                        <label class="field-label">禁用（逻辑删除）:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="newSiteData.codex.deleted"
+                                                @change="handleNewSiteDeletedChange('codex', $event)">
+                                            </el-switch>
+                                            <span v-if="newSiteData.codex.deleted && newSiteData.codex.deletedAt" class="deleted-at-note">
+                                                禁用于 {{ newSiteData.codex.deletedAt }}
+                                            </span>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 <!-- 现有站点列表 -->
                                 <div v-for="(site, index) in friendlyConfigs.codex" :key="index"
-                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                     :class="['config-site-card', { 'site-active': (site && site.active), 'site-deleted': (site && site.deleted) }]">
                                     <div class="config-field">
                                         <label class="field-label">站点名称:</label>
                                         <el-input
@@ -650,6 +698,7 @@
                                         <div class="field-control">
                                             <el-switch
                                                 v-model="site.active"
+                                                :disabled="!!(site && site.deleted)"
                                                 @change="handleActiveChange('codex', index, $event)">
                                             </el-switch>
                                             <div class="config-actions-inline">
@@ -661,12 +710,26 @@
                                                 </el-button>
                                                 <el-button
                                                     @click="testSiteConnection('codex', index)"
+                                                    :disabled="!!(site && site.deleted)"
                                                     type="info"
                                                     size="small"
                                                     plain>
                                                     测试
                                                 </el-button>
                                             </div>
+                                        </div>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">禁用（逻辑删除）:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="site.deleted"
+                                                @change="handleDeletedChange('codex', index, $event)">
+                                            </el-switch>
+                                            <el-tag v-if="site && site.deleted" type="warning" size="small">已禁用</el-tag>
+                                            <span v-if="site && site.deleted && site.deletedAt" class="deleted-at-note">
+                                                禁用于 {{ site.deletedAt }}
+                                            </span>
                                         </div>
                                     </div>
                                 </div>
@@ -694,7 +757,10 @@
     "base_url": "目标站点地址",
     "auth_token": "令牌",
     "api_key": "有些站点使用x-api-key传递就放这里",
-    "active": false
+    "weight": 0,
+    "active": false,
+    "deleted": false,
+    "deleted_at": null
   }
 }</code>
                             </div>
