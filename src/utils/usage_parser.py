@@ -148,6 +148,124 @@ def _extract_from_sse(service: str, text: str) -> Optional[Dict[str, Any]]:
     return last_usage
 
 
+def update_usage_from_sse_chunk(service: str,
+                                chunk_text: str,
+                                previous_usage: Optional[Dict[str, Any]] = None
+                                ) -> Optional[Dict[str, Any]]:
+    """
+    增量解析 SSE/JSON 片段中的 usage 信息，返回最近一次解析到的 usage。
+
+    Args:
+        service: 服务名称（claude/codex）
+        chunk_text: 当前收到的文本片段
+        previous_usage: 上一次解析得到的 usage（可为空）
+
+    Returns:
+        最新解析到的 usage，如果没有新的 usage，则返回 previous_usage
+    """
+    if not chunk_text:
+        return previous_usage
+
+    latest_usage = previous_usage
+    stripped = chunk_text.strip()
+
+    # 优先处理典型的 SSE 片段（包含 data: 行）
+    if "data:" in chunk_text:
+        for raw_chunk in chunk_text.split("\n\n"):
+            lines = [line.strip() for line in raw_chunk.splitlines() if line.strip()]
+            data_lines = [line[5:].strip() for line in lines if line.startswith("data:")]
+            for data_line in data_lines:
+                payload = _safe_json_loads(data_line)
+                if not payload:
+                    continue
+                usage = _extract_usage_from_payload(service, payload)
+                if usage:
+                    latest_usage = usage
+        return latest_usage
+
+    # 非 SSE：尝试将整个文本解析为 JSON
+    payload = _safe_json_loads(stripped)
+    if payload:
+        usage = _extract_usage_from_payload(service, payload)
+        if usage:
+            latest_usage = usage
+
+    return latest_usage
+
+
+def process_sse_buffer(
+    service: str,
+    buffer: str,
+    chunk_text: str,
+    previous_usage: Optional[Dict[str, Any]] = None
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """按 SSE 事件边界解析 usage。
+
+    维护并返回残余 buffer，避免事件在 chunk 边界被截断造成丢失。
+    """
+    if not isinstance(buffer, str):
+        buffer = ""
+    if not chunk_text:
+        return previous_usage, buffer
+
+    text = buffer + chunk_text
+    parts = text.split("\n\n")
+    # 如果文本未以空行结尾，最后一个是未完成事件，放回 buffer
+    remainder = parts.pop() if text and not text.endswith("\n\n") else ""
+
+    latest_usage = previous_usage
+    for part in parts:
+        lines = [line.strip() for line in part.splitlines() if line.strip()]
+        data_lines = [line[5:].strip() for line in lines if line.startswith("data:")]
+        for data_line in data_lines:
+            payload = _safe_json_loads(data_line)
+            if not payload:
+                continue
+            usage = _extract_usage_from_payload(service, payload)
+            if usage:
+                latest_usage = usage
+
+    return latest_usage, remainder
+
+
+def process_ndjson_buffer(
+    service: str,
+    buffer: str,
+    chunk_text: str,
+    previous_usage: Optional[Dict[str, Any]] = None
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """按 NDJSON 行边界解析 usage，返回最新 usage 与剩余未完成行。"""
+    if not isinstance(buffer, str):
+        buffer = ""
+    if not chunk_text:
+        return previous_usage, buffer
+
+    text = buffer + chunk_text
+    # 保留换行以判断最后一行是否完整
+    lines = text.split("\n")
+    has_trailing_newline = text.endswith("\n")
+    if has_trailing_newline:
+        complete_lines = lines[:-1]  # 最后一个是空串
+        remainder = ""
+    else:
+        complete_lines = lines[:-1]
+        remainder = lines[-1]
+
+    latest_usage = previous_usage
+    for line in complete_lines:
+        line = line.strip()
+        if not line:
+            continue
+        payload = _safe_json_loads(line)
+        if not payload:
+            continue
+        usage = _extract_usage_from_payload(service, payload)
+        if usage:
+            latest_usage = usage
+
+    return latest_usage, remainder
+
+
 def extract_usage_from_response(service: str, response_bytes: Optional[bytes]) -> Dict[str, Any]:
     """Extract usage information from raw response bytes."""
     if not response_bytes:

@@ -3,7 +3,7 @@ import hashlib
 import webbrowser
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Set
 from flask import Flask, jsonify, send_file, request
 import os
 from datetime import datetime, timezone
@@ -24,6 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parent / 'static'
 LOG_FILE = DATA_DIR / 'proxy_requests.jsonl'
 OLD_LOG_FILE = DATA_DIR / 'traffic_statistics.jsonl'
 HISTORY_FILE = DATA_DIR / 'history_usage.json'
+HISTORY_TOKENS_FILE = DATA_DIR / 'history_usage_by_token.json'
 
 if OLD_LOG_FILE.exists() and not LOG_FILE.exists():
     try:
@@ -483,6 +484,127 @@ def load_logs() -> list[Dict[str, Any]]:
     return logs
 
 
+def _load_auth_tokens_map() -> Dict[str, Dict[str, Any]]:
+    """载入 auth.json 中的 token 映射，键为 token 字符串。"""
+    try:
+        from src.auth.auth_manager import AuthManager  # 延迟导入避免循环依赖
+    except ImportError:
+        return {}
+
+    try:
+        manager = AuthManager()
+        tokens = manager.list_tokens()
+    except Exception:
+        return {}
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for entry in tokens or []:
+        if not isinstance(entry, dict):
+            continue
+        token_value = entry.get('token')
+        if not isinstance(token_value, str) or not token_value:
+            continue
+        name = entry.get('name')
+        if not isinstance(name, str) or not name:
+            # 回退到截断 token 值但隐藏主体
+            suffix = token_value[-6:] if len(token_value) >= 6 else token_value
+            name = f'令牌({suffix})'
+        services_field = entry.get('services')
+        normalized_services: Set[str] = set()
+        if isinstance(services_field, list):
+            for svc in services_field:
+                if isinstance(svc, str):
+                    normalized_services.add(svc.strip().lower())
+        elif isinstance(services_field, str):
+            normalized_services.add(services_field.strip().lower())
+        if not normalized_services:
+            normalized_services = {'ui', 'claude', 'codex'}
+        mapping[token_value] = {
+            'name': name,
+            'services': normalized_services,
+            'active': bool(entry.get('active', True)),
+        }
+    return mapping
+
+
+def _extract_client_token(entry: Dict[str, Any]) -> str:
+    """从日志条目中提取调用方 token 字符串。"""
+    headers = entry.get('original_headers') or {}
+    if isinstance(headers, dict):
+        lowered = {}
+        for key, value in headers.items():
+            if isinstance(key, str):
+                lowered[key.lower()] = value
+
+        auth_header = lowered.get('authorization')
+        if isinstance(auth_header, str) and auth_header.lower().startswith('bearer '):
+            candidate = auth_header[7:].strip()
+            if candidate.startswith('clp_'):
+                return candidate
+
+        api_key_header = lowered.get('x-api-key')
+        if isinstance(api_key_header, str) and api_key_header.startswith('clp_'):
+            return api_key_header
+    return ''
+
+
+def _clone_usage_by_token_map(data: Dict[str, Dict[str, Dict[str, Dict[str, int]]]]) -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
+    """深拷贝 token usage 结构，避免原地修改。"""
+    return {
+        token: {
+            service: {
+                channel: dict(metrics)
+                for channel, metrics in channels.items()
+            }
+            for service, channels in services.items()
+        }
+        for token, services in data.items()
+    }
+
+
+def aggregate_usage_by_token_from_logs(
+    logs: list[Dict[str, Any]],
+    token_map: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
+    """
+    将日志根据调用方 token 分组，结构：token_name -> service -> channel -> metrics
+    """
+    aggregated: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {}
+
+    for entry in logs:
+        usage = entry.get('usage', {})
+        metrics = usage.get('metrics', {})
+        if not metrics:
+            continue
+
+        service = (usage.get('service') or entry.get('service') or 'unknown').strip().lower()
+        if service not in {'claude', 'codex'}:
+            continue
+        channel = entry.get('channel') or 'unknown'
+
+        token_value = _extract_client_token(entry)
+        if token_value:
+            token_info = token_map.get(token_value)
+            if token_info:
+                display_name = token_info.get('name') or token_value[-6:]
+                allowed_services = token_info.get('services') or {'claude', 'codex'}
+                if service and allowed_services and service not in allowed_services:
+                    continue
+            else:
+                suffix = token_value[-6:] if len(token_value) >= 6 else token_value
+                display_name = f'未登记({suffix})'
+        else:
+            display_name = '匿名访问'
+            token_info = None
+
+        token_bucket = aggregated.setdefault(display_name, {})
+        service_bucket = token_bucket.setdefault(service, {})
+        channel_bucket = service_bucket.setdefault(channel, empty_metrics())
+        merge_usage_metrics(channel_bucket, metrics)
+
+    return aggregated
+
+
 def build_log_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
     """Return a lightweight projection of a log entry for list views."""
     return {
@@ -534,6 +656,49 @@ def save_history_usage(data: Dict[str, Dict[str, Dict[str, int]]]) -> None:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
+def load_history_usage_by_token() -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
+    if not HISTORY_TOKENS_FILE.exists():
+        return {}
+    try:
+        with open(HISTORY_TOKENS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    history: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {}
+    for token, services in (data or {}).items():
+        if not isinstance(services, dict):
+            continue
+        token_bucket: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for service, channels in services.items():
+            if not isinstance(channels, dict):
+                continue
+            service_bucket: Dict[str, Dict[str, int]] = {}
+            for channel, metrics in channels.items():
+                normalized = empty_metrics()
+                if isinstance(metrics, dict):
+                    merge_usage_metrics(normalized, metrics)
+                service_bucket[channel] = normalized
+            token_bucket[service] = service_bucket
+        history[token] = token_bucket
+    return history
+
+
+def save_history_usage_by_token(data: Dict[str, Dict[str, Dict[str, Dict[str, int]]]]) -> None:
+    serializable = {
+        token: {
+            service: {
+                channel: {key: int(value) for key, value in metrics.items()}
+                for channel, metrics in channels.items()
+            }
+            for service, channels in services.items()
+        }
+        for token, services in data.items()
+    }
+    with open(HISTORY_TOKENS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
 def aggregate_usage_from_logs(logs: list[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, int]]]:
     aggregated: Dict[str, Dict[str, Dict[str, int]]] = {}
     for entry in logs:
@@ -556,6 +721,20 @@ def merge_history_usage(base: Dict[str, Dict[str, Dict[str, int]]],
         for channel, metrics in channels.items():
             channel_bucket = service_bucket.setdefault(channel, empty_metrics())
             merge_usage_metrics(channel_bucket, metrics)
+    return base
+
+
+def merge_history_usage_by_token(
+    base: Dict[str, Dict[str, Dict[str, Dict[str, int]]]],
+    addition: Dict[str, Dict[str, Dict[str, Dict[str, int]]]]
+) -> Dict[str, Dict[str, Dict[str, Dict[str, int]]]]:
+    for token, services in addition.items():
+        token_bucket = base.setdefault(token, {})
+        for service, channels in services.items():
+            service_bucket = token_bucket.setdefault(service, {})
+            for channel, metrics in channels.items():
+                channel_bucket = service_bucket.setdefault(channel, empty_metrics())
+                merge_usage_metrics(channel_bucket, metrics)
     return base
 
 
@@ -987,6 +1166,14 @@ def clear_logs():
                 merged = merge_history_usage(history_usage, aggregated)
                 save_history_usage(merged)
 
+            # 同步合并到 token 维度的历史，避免“清空日志”后丢失令牌累计
+            token_map = _load_auth_tokens_map()
+            token_aggregated = aggregate_usage_by_token_from_logs(logs, token_map)
+            if token_aggregated:
+                history_usage_tokens = load_history_usage_by_token()
+                merged_tokens = merge_history_usage_by_token(history_usage_tokens, token_aggregated)
+                save_history_usage_by_token(merged_tokens)
+
         log_path = LOG_FILE if LOG_FILE.exists() else (
             OLD_LOG_FILE if OLD_LOG_FILE.exists() else LOG_FILE
         )
@@ -1005,6 +1192,7 @@ def get_usage_details():
     try:
         snapshot = build_usage_snapshot()
         combined_usage = snapshot['combined_usage']
+        logs = snapshot['logs']
 
         services_payload: Dict[str, Any] = {}
         for service, channels in combined_usage.items():
@@ -1027,12 +1215,53 @@ def get_usage_details():
         for service_data in services_payload.values():
             merge_usage_metrics(totals_metrics, service_data['overall']['metrics'])
 
+        token_map = _load_auth_tokens_map()
+        current_usage_by_token = aggregate_usage_by_token_from_logs(logs, token_map)
+        history_usage_by_token = load_history_usage_by_token()
+        combined_usage_by_token = merge_history_usage_by_token(
+            _clone_usage_by_token_map(history_usage_by_token),
+            current_usage_by_token
+        )
+
+        tokens_payload: Dict[str, Any] = {}
+        for token_name, services_map in combined_usage_by_token.items():
+            service_blocks: Dict[str, Any] = {}
+            token_totals = empty_metrics()
+            for service_name, channels_map in services_map.items():
+                overall_metrics = compute_total_metrics(channels_map)
+                service_blocks[service_name] = {
+                    'overall': {
+                        'metrics': overall_metrics,
+                        'formatted': format_metrics(overall_metrics)
+                    },
+                    'channels': {
+                        channel: {
+                            'metrics': metrics,
+                            'formatted': format_metrics(metrics)
+                        }
+                        for channel, metrics in channels_map.items()
+                    }
+                }
+                merge_usage_metrics(token_totals, overall_metrics)
+
+            if not any(token_totals.values()):
+                continue
+
+            tokens_payload[token_name] = {
+                'totals': {
+                    'metrics': token_totals,
+                    'formatted': format_metrics(token_totals)
+                },
+                'services': service_blocks
+            }
+
         response = {
             'totals': {
                 'metrics': totals_metrics,
                 'formatted': format_metrics(totals_metrics)
             },
-            'services': services_payload
+            'services': services_payload,
+            'tokens': tokens_payload
         }
         return jsonify(response)
     except Exception as e:
@@ -1045,12 +1274,18 @@ def clear_usage():
     try:
         # 1. 先清空日志（复用现有功能）
         logs = load_logs()
+        token_map = _load_auth_tokens_map()
         if logs:
             aggregated = aggregate_usage_from_logs(logs)
             if aggregated:
                 history_usage = load_history_usage()
                 merged = merge_history_usage(history_usage, aggregated)
                 save_history_usage(merged)
+            token_aggregated = aggregate_usage_by_token_from_logs(logs, token_map)
+            if token_aggregated:
+                history_usage_tokens = load_history_usage_by_token()
+                merged_tokens = merge_history_usage_by_token(history_usage_tokens, token_aggregated)
+                save_history_usage_by_token(merged_tokens)
 
         log_path = LOG_FILE if LOG_FILE.exists() else (
             OLD_LOG_FILE if OLD_LOG_FILE.exists() else LOG_FILE
@@ -1066,6 +1301,14 @@ def clear_usage():
                 for key in history_usage[service][channel]:
                     history_usage[service][channel][key] = 0
         save_history_usage(history_usage)
+
+        history_usage_tokens = load_history_usage_by_token()
+        for token in history_usage_tokens:
+            for service in history_usage_tokens[token]:
+                for channel in history_usage_tokens[token][service]:
+                    for key in history_usage_tokens[token][service][channel]:
+                        history_usage_tokens[token][service][channel][key] = 0
+        save_history_usage_by_token(history_usage_tokens)
 
         return jsonify({'success': True, 'message': 'Token使用记录已清空'})
     except Exception as e:

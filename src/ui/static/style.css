@@ -636,9 +636,55 @@ header h1 {
 }
 
 .usage-channel-empty {
-    font-size: 12px;
+    font-size: 13px;
     color: #7f8c8d;
     text-align: center;
+    padding: 16px;
+    background: #f8fafc;
+    border-radius: 8px;
+}
+
+.usage-token-wrapper {
+    margin-top: 24px;
+}
+
+.usage-token-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 12px;
+}
+
+.usage-token-section {
+    margin-top: 16px;
+}
+
+.usage-token-empty {
+    margin-top: 12px;
+}
+
+.usage-token-service-block {
+    margin-top: 16px;
+    padding: 12px 16px;
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    background-color: #fafcff;
+}
+
+.usage-token-service-block + .usage-token-service-block {
+    margin-top: 12px;
+}
+
+.usage-token-service-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.usage-token-service-header h4 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
 }
 
 .usage-drawer-actions {

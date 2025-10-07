@@ -243,7 +243,8 @@ const app = createApp({
                 metrics: createEmptyMetrics(),
                 formatted: createEmptyFormatted()
             },
-            services: {}
+            services: {},
+            tokens: {}
         });
         const usageMetricLabels = {
             input: '输入',
@@ -278,6 +279,7 @@ const app = createApp({
         const resetUsageDetails = () => {
             usageDetails.totals = normalizeUsageBlock({});
             usageDetails.services = {};
+            usageDetails.tokens = {};
         };
 
         const formatUsageValue = (value) => {
@@ -387,6 +389,17 @@ const app = createApp({
         const formatChannelName = (name) => {
             if (!name) return '未知';
             return name === 'unknown' ? '未标记' : name;
+        };
+
+        const hasUsageData = (block) => {
+            if (!block) {
+                return false;
+            }
+            const metricsSource = block.displayMetrics || block.metrics;
+            if (!metricsSource) {
+                return false;
+            }
+            return metricKeys.some(key => getNumeric(metricsSource[key]) > 0);
         };
 
         // 获取模型选项
@@ -632,6 +645,33 @@ const app = createApp({
                     };
                 });
                 usageDetails.services = services;
+
+                const tokenEntries = Object.entries(data.tokens || {});
+                const tokens = {};
+                tokenEntries.forEach(([tokenName, tokenPayload]) => {
+                    const tokenTotals = updateFormattedFromMetrics(normalizeUsageBlock(tokenPayload?.totals || {}));
+                    const serviceBlocks = {};
+                    ['claude', 'codex'].forEach(service => {
+                        const servicePayload = tokenPayload?.services?.[service] || {};
+                        const overallBlock = adjustUsageBlockForService(service, servicePayload?.overall || {});
+                        const channels = {};
+                        Object.entries(servicePayload?.channels || {}).forEach(([channelName, channelPayload]) => {
+                            if (!channelName || channelName === 'unknown') {
+                                return;
+                            }
+                            channels[channelName] = adjustUsageBlockForService(service, channelPayload || {});
+                        });
+                        serviceBlocks[service] = {
+                            overall: overallBlock,
+                            channels
+                        };
+                    });
+                    tokens[tokenName] = {
+                        totals: tokenTotals,
+                        services: serviceBlocks
+                    };
+                });
+                usageDetails.tokens = tokens;
 
                 if (serviceEntries.length === 0) {
                     usageDetails.totals = adjustUsageBlockForService('codex', data.totals || {});
@@ -2426,6 +2466,7 @@ const app = createApp({
             formatUsageValue,
             formatUsageSummary,
             getUsageFormattedValue,
+            hasUsageData,
             formatChannelName,
             formatServiceWithChannel,
             formatMethodWithURL,

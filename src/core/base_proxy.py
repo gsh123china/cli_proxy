@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import subprocess
+import os
 import sys
 import threading
 import time
@@ -23,6 +24,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..utils.usage_parser import (
     extract_usage_from_response,
     normalize_usage_record,
+    update_usage_from_sse_chunk,
+    process_sse_buffer,
+    process_ndjson_buffer,
 )
 from ..utils.platform_helper import create_detached_process
 from .realtime_hub import RealTimeRequestHub
@@ -239,45 +243,65 @@ class BaseProxyService(ABC):
                 if total_response_bytes is not None:
                     log_entry['response_bytes'] = total_response_bytes
 
-                # 限制日志文件为最多100条记录
+                # 限制日志文件为最多1000条记录
                 self._maintain_log_limit(log_entry)
             except Exception as exc:
                 print(f"日志记录失败: {exc}")
 
         await asyncio.to_thread(_write_log)
 
-    def _maintain_log_limit(self, new_log_entry: dict, max_logs: int = 100):
-        """维护日志文件条数限制，只保留最近的max_logs条记录"""
+    def _maintain_log_limit(self, new_log_entry: dict, max_logs: int = 1000):
+        """维护日志文件条数限制（跨进程文件锁），只保留最近的max_logs条记录。"""
+        try:
+            import fcntl  # POSIX 文件锁
+        except Exception:
+            fcntl = None
+
         with self._log_lock:
             try:
-                # 读取现有日志
-                existing_logs = []
-                if self.traffic_log.exists():
-                    with open(self.traffic_log, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                try:
-                                    log_data = json.loads(line)
-                                    existing_logs.append(log_data)
-                                except json.JSONDecodeError:
-                                    continue
+                # 确保目录存在
+                self.traffic_log.parent.mkdir(parents=True, exist_ok=True)
 
-                # 添加新日志条目
-                existing_logs.append(new_log_entry)
+                # 以 a+ 打开文件，获取独占锁，在同一 fd 上完成读-改-写
+                with open(self.traffic_log, 'a+', encoding='utf-8') as f:
+                    try:
+                        if fcntl is not None:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    except Exception:
+                        pass
 
-                # 只保留最近的max_logs条记录
-                if len(existing_logs) > max_logs:
-                    existing_logs = existing_logs[-max_logs:]
+                    # 读取现有内容
+                    f.seek(0)
+                    existing_logs = []
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            log_data = json.loads(line)
+                            existing_logs.append(log_data)
+                        except json.JSONDecodeError:
+                            continue
 
-                # 重写整个日志文件
-                with open(self.traffic_log, 'w', encoding='utf-8') as f:
+                    # 追加与裁剪
+                    existing_logs.append(new_log_entry)
+                    if len(existing_logs) > max_logs:
+                        existing_logs = existing_logs[-max_logs:]
+
+                    # 重写文件
+                    f.seek(0)
+                    f.truncate(0)
                     for log_entry in existing_logs:
                         f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
 
             except Exception as exc:
                 print(f"维护日志文件限制失败: {exc}")
-                # 如果维护失败，直接追加写入
+                # 如果维护失败，直接追加写入（尽最大努力）
                 try:
                     with open(self.traffic_log, 'a', encoding='utf-8') as f:
                         f.write(json.dumps(new_log_entry, ensure_ascii=False) + '\n')
@@ -861,9 +885,15 @@ class BaseProxyService(ABC):
                 response_truncated = False
                 first_chunk = True
                 lb_result_recorded = False
+                last_usage = None
+                sse_buffer = ''
+                nd_buffer = ''
+                resp_ct = response.headers.get('content-type', '')
+                sse_mode = 'text/event-stream' in (resp_ct or '').lower()
+                ndjson_mode = 'application/x-ndjson' in (resp_ct or '').lower()
 
                 async def iterator():
-                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage
                     try:
                         async for chunk in response.aiter_bytes():
                             if not chunk:
@@ -875,6 +905,13 @@ class BaseProxyService(ABC):
                             try:
                                 chunk_text = chunk.decode('utf-8', errors='ignore')
                                 if chunk_text.strip():
+                                    # 解析 usage（SSE/NDJSON 缓冲安全）
+                                    if sse_mode or ('data:' in chunk_text):
+                                        last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, chunk_text, last_usage)
+                                    elif ndjson_mode:
+                                        last_usage, nd_buffer = process_ndjson_buffer(self.service_name, nd_buffer, chunk_text, last_usage)
+                                    else:
+                                        last_usage = update_usage_from_sse_chunk(self.service_name, chunk_text, last_usage)
                                     await self.realtime_hub.response_chunk(request_id, chunk_text, current_duration)
                             except Exception:
                                 pass
@@ -895,6 +932,14 @@ class BaseProxyService(ABC):
                             duration_ms=final_duration,
                             success=self._is_success_status(sc)
                         )
+                        # 尝试处理可能残留在缓冲区的尾部事件
+                        try:
+                            if sse_buffer:
+                                last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, "\n\n", last_usage)
+                            if nd_buffer:
+                                last_usage, nd_buffer = process_ndjson_buffer(self.service_name, nd_buffer + "\n", "", last_usage)
+                        except Exception:
+                            pass
                         await response.aclose()
                         response_content = bytes(collected) if collected else None
                         await self.log_request(
@@ -906,6 +951,7 @@ class BaseProxyService(ABC):
                             filtered_body=filtered_body,
                             original_headers=original_headers,
                             original_body=original_body,
+                            usage=last_usage,
                             response_content=response_content,
                             channel=config_name,
                             response_truncated=response_truncated,
@@ -966,9 +1012,18 @@ class BaseProxyService(ABC):
                     lb_result_recorded = True
                 excluded_response_headers = {'connection', 'transfer-encoding'}
                 response_headers = {k: v for k, v in response.headers.items() if k.lower() not in excluded_response_headers}
-                collected = bytearray(); total_response_bytes = 0; response_truncated = False; first_chunk = True
+                collected = bytearray()
+                total_response_bytes = 0
+                response_truncated = False
+                first_chunk = True
+                last_usage = None
+                sse_buffer = ''
+                nd_buffer = ''
+                resp_ct = response.headers.get('content-type', '')
+                sse_mode = 'text/event-stream' in (resp_ct or '').lower()
+                ndjson_mode = 'application/x-ndjson' in (resp_ct or '').lower()
                 async def iterator():
-                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage, sse_buffer, nd_buffer
                     try:
                         async for chunk in response.aiter_bytes():
                             if not chunk: continue
@@ -979,6 +1034,12 @@ class BaseProxyService(ABC):
                             try:
                                 chunk_text = chunk.decode('utf-8', errors='ignore')
                                 if chunk_text.strip():
+                                    if sse_mode or ('data:' in chunk_text):
+                                        last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, chunk_text, last_usage)
+                                    elif ndjson_mode:
+                                        last_usage, nd_buffer = process_ndjson_buffer(self.service_name, nd_buffer, chunk_text, last_usage)
+                                    else:
+                                        last_usage = update_usage_from_sse_chunk(self.service_name, chunk_text, last_usage)
                                     await self.realtime_hub.response_chunk(request_id, chunk_text, current_duration)
                             except Exception:
                                 pass
@@ -993,9 +1054,17 @@ class BaseProxyService(ABC):
                     finally:
                         final_duration = int((time.time() - start_time) * 1000)
                         await self.realtime_hub.request_completed(request_id=request_id, status_code=status_code, duration_ms=final_duration, success=self._is_success_status(status_code))
+                        # 处理尾部缓冲
+                        try:
+                            if sse_buffer:
+                                last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, "\n\n", last_usage)
+                            if nd_buffer:
+                                last_usage, nd_buffer = process_ndjson_buffer(self.service_name, nd_buffer + "\n", "", last_usage)
+                        except Exception:
+                            pass
                         await response.aclose()
                         response_content = bytes(collected) if collected else None
-                        await self.log_request(method=request.method, path=path, status_code=status_code, duration_ms=final_duration, target_headers=target_headers, filtered_body=filtered_body, original_headers=original_headers, original_body=original_body, response_content=response_content, channel=active_config_name, response_truncated=response_truncated, total_response_bytes=total_response_bytes, target_url=target_url)
+                        await self.log_request(method=request.method, path=path, status_code=status_code, duration_ms=final_duration, target_headers=target_headers, filtered_body=filtered_body, original_headers=original_headers, original_body=original_body, usage=last_usage, response_content=response_content, channel=active_config_name, response_truncated=response_truncated, total_response_bytes=total_response_bytes, target_url=target_url)
                         if not lb_result_recorded:
                             await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
                             lb_result_recorded = True
