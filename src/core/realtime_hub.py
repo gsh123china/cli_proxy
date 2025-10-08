@@ -28,6 +28,7 @@ class RealTimeRequest:
     request_headers: Optional[Dict] = None
     response_chunks: Optional[List[str]] = None
     response_truncated: bool = False
+    response_bytes: int = 0
     target_url: Optional[str] = None
 
     def __post_init__(self):
@@ -169,13 +170,18 @@ class RealTimeRequestHub:
             request = self.active_requests[request_id]
 
             # 限制单个响应的总长度，避免内存爆炸
-            current_length = sum(len(c) for c in request.response_chunks)
-            if current_length < 2 * 1024 * 1024:  # 2MB限制
-                request.response_chunks.append(chunk)
-            else:
-                if not request.response_truncated:
+            limit = 2 * 1024 * 1024  # 2MB限制
+            if request.response_bytes < limit:
+                remaining = limit - request.response_bytes
+                if remaining > 0:
+                    request.response_chunks.append(chunk[:remaining])
+                    request.response_bytes += min(len(chunk), remaining)
+                if len(chunk) > remaining and not request.response_truncated:
                     request.response_truncated = True
                     request.response_chunks.append("[...响应过长，已截断...]")
+            elif not request.response_truncated:
+                request.response_truncated = True
+                request.response_chunks.append("[...响应过长，已截断...]")
 
             request.duration_ms = duration_ms
 

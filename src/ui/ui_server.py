@@ -25,6 +25,8 @@ STATIC_DIR = Path(__file__).resolve().parent / 'static'
 
 LOG_FILE = DATA_DIR / 'proxy_requests.jsonl'
 OLD_LOG_FILE = DATA_DIR / 'traffic_statistics.jsonl'
+CLAUDE_LOG_FILE = DATA_DIR / 'proxy_requests_claude.jsonl'
+CODEX_LOG_FILE = DATA_DIR / 'proxy_requests_codex.jsonl'
 HISTORY_FILE = DATA_DIR / 'history_usage.json'
 HISTORY_TOKENS_FILE = DATA_DIR / 'history_usage_by_token.json'
 
@@ -463,26 +465,41 @@ def _compute_log_id(entry: Dict[str, Any], raw_line: str, index: int) -> str:
     return f'legacy-{digest}-{index}'
 
 
+def _candidate_log_files() -> list[Path]:
+    # 读取服务拆分日志 + 旧单文件日志（保持向后兼容）
+    files = []
+    for p in (CLAUDE_LOG_FILE, CODEX_LOG_FILE, LOG_FILE, OLD_LOG_FILE):
+        if p.exists():
+            files.append(p)
+    return files
+
+
 def load_logs() -> list[Dict[str, Any]]:
     logs: list[Dict[str, Any]] = []
-    log_path = LOG_FILE if LOG_FILE.exists() else (
-        OLD_LOG_FILE if OLD_LOG_FILE.exists() else None
-    )
-    if log_path is None:
-        return logs
+    idx = 0
+    for log_path in _candidate_log_files():
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    entry = _safe_json_load(line)
+                    if not entry:
+                        continue
+                    service = entry.get('service') or entry.get('usage', {}).get('service') or 'unknown'
+                    entry['usage'] = normalize_usage_record(service, entry.get('usage'))
+                    entry['id'] = _compute_log_id(entry, raw_line, idx)
+                    logs.append(entry)
+                    idx += 1
+        except (OSError, UnicodeDecodeError):
+            continue
 
-    with open(log_path, 'r', encoding='utf-8') as f:
-        for index, raw_line in enumerate(f):
-            line = raw_line.strip()
-            if not line:
-                continue
-            entry = _safe_json_load(line)
-            if not entry:
-                continue
-            service = entry.get('service') or entry.get('usage', {}).get('service') or 'unknown'
-            entry['usage'] = normalize_usage_record(service, entry.get('usage'))
-            entry['id'] = _compute_log_id(entry, raw_line, index)
-            logs.append(entry)
+    # 尝试按时间排序，保证跨文件合并后的顺序合理
+    try:
+        logs.sort(key=lambda e: (str(e.get('timestamp') or ''), e.get('id') or ''))
+    except Exception:
+        pass
     return logs
 
 
@@ -1320,12 +1337,13 @@ def clear_logs():
                 merged_tokens = merge_history_usage_by_token(history_usage_tokens, token_aggregated)
                 save_history_usage_by_token(merged_tokens)
 
-        log_path = LOG_FILE if LOG_FILE.exists() else (
-            OLD_LOG_FILE if OLD_LOG_FILE.exists() else LOG_FILE
-        )
-        log_path.write_text('', encoding='utf-8')
-        if log_path != LOG_FILE:
-            LOG_FILE.touch(exist_ok=True)
+        # 清空所有候选日志文件
+        for p in _candidate_log_files() or [LOG_FILE]:
+            try:
+                p.write_text('', encoding='utf-8')
+            except Exception:
+                pass
+        LOG_FILE.touch(exist_ok=True)
         
         return jsonify({'success': True, 'message': '日志已清空'})
     except Exception as e:
@@ -1452,12 +1470,12 @@ def clear_usage():
                 merged_tokens = merge_history_usage_by_token(history_usage_tokens, token_aggregated)
                 save_history_usage_by_token(merged_tokens)
 
-        log_path = LOG_FILE if LOG_FILE.exists() else (
-            OLD_LOG_FILE if OLD_LOG_FILE.exists() else LOG_FILE
-        )
-        log_path.write_text('', encoding='utf-8')
-        if log_path != LOG_FILE:
-            LOG_FILE.touch(exist_ok=True)
+        for p in _candidate_log_files() or [LOG_FILE]:
+            try:
+                p.write_text('', encoding='utf-8')
+            except Exception:
+                pass
+        LOG_FILE.touch(exist_ok=True)
 
         # 2. 清空 history_usage.json 中的所有数值
         history_usage = load_history_usage()

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -56,14 +57,8 @@ class BaseProxyService(ABC):
         # 数据目录
         self.data_dir = Path.home() / '.clp/data'
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.traffic_log = self.data_dir / 'proxy_requests.jsonl'
-        old_log = self.data_dir / 'traffic_statistics.jsonl'
-        if not self.traffic_log.exists() and old_log.exists():
-            try:
-                old_log.rename(self.traffic_log)
-            except OSError:
-                # 如果重命名失败，则保留旧文件并继续使用旧路径
-                self.traffic_log = old_log
+        # 按服务拆分日志文件，降低跨进程写入争用
+        self.traffic_log = self.data_dir / f'proxy_requests_{self.service_name}.jsonl'
 
         # 路由配置文件
         self.routing_config_file = self.data_dir / 'model_router_config.json'
@@ -87,6 +82,9 @@ class BaseProxyService(ABC):
         # 并发控制锁
         self._lb_lock = threading.RLock()
         self._log_lock = threading.RLock()
+        self._log_max_entries = 1000
+        self._log_cache = deque(maxlen=self._log_max_entries)
+        self._log_cache_loaded = False
 
         # 初始化FastAPI应用
         self.app = FastAPI()
@@ -268,6 +266,37 @@ class BaseProxyService(ABC):
 
         await asyncio.to_thread(_write_log)
 
+    def _ensure_log_cache_loaded(self, max_logs: int):
+        if self._log_cache_loaded and self._log_cache.maxlen == max_logs:
+            return
+
+        if self._log_cache.maxlen != max_logs:
+            self._log_cache = deque(self._log_cache, maxlen=max_logs)
+
+        try:
+            self.traffic_log.parent.mkdir(parents=True, exist_ok=True)
+            if not self.traffic_log.exists():
+                self._log_cache.clear()
+                self._log_cache_loaded = True
+                return
+
+            entries = deque(maxlen=max_logs)
+            with open(self.traffic_log, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            self._log_cache = entries
+            self._log_cache_loaded = True
+        except Exception as exc:
+            print(f"初始化日志缓存失败: {exc}")
+            self._log_cache = deque(maxlen=max_logs)
+            self._log_cache_loaded = True
+
     def _maintain_log_limit(self, new_log_entry: dict, max_logs: int = 1000):
         """维护日志文件条数限制（跨进程文件锁），只保留最近的max_logs条记录。"""
         try:
@@ -277,39 +306,20 @@ class BaseProxyService(ABC):
 
         with self._log_lock:
             try:
-                # 确保目录存在
-                self.traffic_log.parent.mkdir(parents=True, exist_ok=True)
+                max_logs = max_logs or self._log_max_entries
+                self._log_max_entries = max_logs
+                self._ensure_log_cache_loaded(max_logs)
 
-                # 以 a+ 打开文件，获取独占锁，在同一 fd 上完成读-改-写
-                with open(self.traffic_log, 'a+', encoding='utf-8') as f:
+                self._log_cache.append(new_log_entry)
+
+                # 以 w 打开文件，获取独占锁，写入缓存内容
+                with open(self.traffic_log, 'w', encoding='utf-8') as f:
                     try:
                         if fcntl is not None:
                             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                     except Exception:
                         pass
-
-                    # 读取现有内容
-                    f.seek(0)
-                    existing_logs = []
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            log_data = json.loads(line)
-                            existing_logs.append(log_data)
-                        except json.JSONDecodeError:
-                            continue
-
-                    # 追加与裁剪
-                    existing_logs.append(new_log_entry)
-                    if len(existing_logs) > max_logs:
-                        existing_logs = existing_logs[-max_logs:]
-
-                    # 重写文件
-                    f.seek(0)
-                    f.truncate(0)
-                    for log_entry in existing_logs:
+                    for log_entry in self._log_cache:
                         f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
                     f.flush()
                     try:
@@ -977,8 +987,11 @@ class BaseProxyService(ABC):
                 sse_mode = 'text/event-stream' in (resp_ct or '').lower()
                 ndjson_mode = 'application/x-ndjson' in (resp_ct or '').lower()
 
+                iterator_error: Optional[BaseException] = None
+                iterator_error_status: Optional[int] = None
+
                 async def iterator():
-                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage, iterator_error, iterator_error_status, sse_buffer, nd_buffer
                     try:
                         async for chunk in response.aiter_bytes():
                             if not chunk:
@@ -990,7 +1003,6 @@ class BaseProxyService(ABC):
                             try:
                                 chunk_text = chunk.decode('utf-8', errors='ignore')
                                 if chunk_text.strip():
-                                    # 解析 usage（SSE/NDJSON 缓冲安全）
                                     if sse_mode or ('data:' in chunk_text):
                                         last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, chunk_text, last_usage)
                                     elif ndjson_mode:
@@ -1009,15 +1021,25 @@ class BaseProxyService(ABC):
                             else:
                                 response_truncated = True
                             yield chunk
+                    except Exception as exc:
+                        iterator_error = exc
+                        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                            iterator_error_status = int(exc.response.status_code)
+                        elif isinstance(exc, httpx.TimeoutException):
+                            iterator_error_status = 504
+                        else:
+                            iterator_error_status = 502
+                        raise
                     finally:
                         final_duration = int((time.time() - start_time) * 1000)
+                        success = iterator_error is None and self._is_success_status(sc)
+                        status_for_log = sc if success else (iterator_error_status or 502)
                         await self.realtime_hub.request_completed(
                             request_id=request_id,
-                            status_code=sc,
+                            status_code=status_for_log,
                             duration_ms=final_duration,
-                            success=self._is_success_status(sc)
+                            success=success
                         )
-                        # 尝试处理可能残留在缓冲区的尾部事件
                         try:
                             if sse_buffer:
                                 last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, "\n\n", last_usage)
@@ -1030,7 +1052,7 @@ class BaseProxyService(ABC):
                         await self.log_request(
                             method=request.method,
                             path=path,
-                            status_code=sc,
+                            status_code=status_for_log,
                             duration_ms=final_duration,
                             target_headers=headers,
                             filtered_body=filtered_body,
@@ -1044,7 +1066,8 @@ class BaseProxyService(ABC):
                             target_url=url,
                         )
                         if not lb_result_recorded:
-                            await asyncio.to_thread(self._record_lb_result, config_name, sc)
+                            lb_status = sc if success else None
+                            await asyncio.to_thread(self._record_lb_result, config_name, lb_status)
                             lb_result_recorded = True
 
                 streaming_resp = StreamingResponse(iterator(), status_code=sc, headers=response_headers)
@@ -1107,11 +1130,15 @@ class BaseProxyService(ABC):
                 resp_ct = response.headers.get('content-type', '')
                 sse_mode = 'text/event-stream' in (resp_ct or '').lower()
                 ndjson_mode = 'application/x-ndjson' in (resp_ct or '').lower()
+                iterator_error: Optional[BaseException] = None
+                iterator_error_status: Optional[int] = None
+
                 async def iterator():
-                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage, sse_buffer, nd_buffer
+                    nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded, last_usage, sse_buffer, nd_buffer, iterator_error, iterator_error_status
                     try:
                         async for chunk in response.aiter_bytes():
-                            if not chunk: continue
+                            if not chunk:
+                                continue
                             current_duration = int((time.time() - start_time) * 1000)
                             if first_chunk:
                                 await self.realtime_hub.request_streaming(request_id, current_duration)
@@ -1132,14 +1159,30 @@ class BaseProxyService(ABC):
                             if len(collected) < self.max_logged_response_bytes:
                                 remaining = self.max_logged_response_bytes - len(collected)
                                 collected.extend(chunk[:remaining])
-                                if len(chunk) > remaining: response_truncated = True
+                                if len(chunk) > remaining:
+                                    response_truncated = True
                             else:
                                 response_truncated = True
                             yield chunk
+                    except Exception as exc:
+                        iterator_error = exc
+                        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                            iterator_error_status = int(exc.response.status_code)
+                        elif isinstance(exc, httpx.TimeoutException):
+                            iterator_error_status = 504
+                        else:
+                            iterator_error_status = 502
+                        raise
                     finally:
                         final_duration = int((time.time() - start_time) * 1000)
-                        await self.realtime_hub.request_completed(request_id=request_id, status_code=status_code, duration_ms=final_duration, success=self._is_success_status(status_code))
-                        # 处理尾部缓冲
+                        success = iterator_error is None and self._is_success_status(status_code)
+                        status_for_log = status_code if success else (iterator_error_status or 502)
+                        await self.realtime_hub.request_completed(
+                            request_id=request_id,
+                            status_code=status_for_log,
+                            duration_ms=final_duration,
+                            success=success
+                        )
                         try:
                             if sse_buffer:
                                 last_usage, sse_buffer = process_sse_buffer(self.service_name, sse_buffer, "\n\n", last_usage)
@@ -1149,9 +1192,25 @@ class BaseProxyService(ABC):
                             pass
                         await response.aclose()
                         response_content = bytes(collected) if collected else None
-                        await self.log_request(method=request.method, path=path, status_code=status_code, duration_ms=final_duration, target_headers=target_headers, filtered_body=filtered_body, original_headers=original_headers, original_body=original_body, usage=last_usage, response_content=response_content, channel=active_config_name, response_truncated=response_truncated, total_response_bytes=total_response_bytes, target_url=target_url)
+                        await self.log_request(
+                            method=request.method,
+                            path=path,
+                            status_code=status_for_log,
+                            duration_ms=final_duration,
+                            target_headers=target_headers,
+                            filtered_body=filtered_body,
+                            original_headers=original_headers,
+                            original_body=original_body,
+                            usage=last_usage,
+                            response_content=response_content,
+                            channel=active_config_name,
+                            response_truncated=response_truncated,
+                            total_response_bytes=total_response_bytes,
+                            target_url=target_url
+                        )
                         if not lb_result_recorded:
-                            await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                            lb_status = status_code if success else None
+                            await asyncio.to_thread(self._record_lb_result, active_config_name, lb_status)
                             lb_result_recorded = True
                 return StreamingResponse(iterator(), status_code=status_code, headers=response_headers)
             except httpx.RequestError as exc:
