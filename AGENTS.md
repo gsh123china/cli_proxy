@@ -2,8 +2,23 @@
 
 ## 项目结构与模块组织
 - 代码位于 `src/`：`claude/`、`codex/`、`ui/`、`core/`、`config/`、`filter/`、`utils/`、`auth/`。
+- **核心文件**：
+  - `src/core/base_proxy.py`：BaseProxyService（代理核心逻辑）和 BaseServiceController（服务生命周期管理）
+  - `src/core/realtime_hub.py`：RealTimeRequestHub（WebSocket 实时事件广播）
 - CLI 入口：`src/main.py`（安装后命令为 `clp`）。静态资源：`src/ui/static/`；文档图片：`assets/`；构建产物：`dist/`。
 - 默认端口：Claude `3210`、Codex `3211`、UI `3300`。运行/日志与数据目录：`~/.clp/run`、`~/.clp/data`。
+
+## BaseProxyService 架构概览
+- **请求处理流程**（7个阶段）：Endpoint 过滤 → 模型路由 → 负载均衡选配置 → 构建请求 → 发送到上游 → 处理响应（重试） → 记录日志。
+- **三层过滤机制**：
+  1. Endpoint 过滤（最高优先级，命中即阻断）
+  2. Header 过滤（移除敏感请求头）
+  3. 请求体过滤（替换/移除敏感数据）
+- **负载均衡模式**：
+  - `active-first`：始终使用激活配置，无重试
+  - `weight-based`：按权重选择健康配置，支持多候选重试（两轮），失败计数自动重置（可配置冷却期）
+- **流式响应**：支持 SSE/NDJSON，逐块转发，实时解析 usage，广播 WebSocket 事件。
+- **日志系统**：按服务拆分（`proxy_requests_{service}.jsonl`），内存缓存 + 文件锁，保留最近 1000 条。
 
 ## 构建、测试与开发命令
 - 开发安装：`python3 -m venv clp-env && source clp-env/bin/activate && pip install -e .`

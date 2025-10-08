@@ -6,11 +6,12 @@ CLP 是一个本地CLI代理工具，用于管理和代理AI服务（如Claude�
 
 ## 亮点
 - **动态切换配置**: 支持命令行/UI界面动态切换不同的服务配置，【无需重启claude/codex命令行终端，上下文保留】
-- **敏感数据过滤**: 可将敏感数据配置到请求过滤器中，防止泄露
+- **三层敏感数据过滤**: Endpoint 阻断 → Header 过滤 → 请求体过滤，全方位保护隐私
+- **智能负载均衡**: 支持"号池管理"，按权重智能选择，失败自动切换，支持两轮重试和自动重置
 - **多服务支持**: 支持各种中转站配置，无需繁琐调整json配置后重启客户端
-- **token使用统计**: 解析请求中的token使用情况
+- **实时监控**: WebSocket 推送请求生命周期事件、负载均衡切换事件、响应块数据
+- **token使用统计**: 自动解析请求中的token使用情况（支持 SSE/NDJSON 流式响应）
 - **模型路由管理**: 支持自定义模型路由，灵活控制请求目标站点的模型名称
-- **负载均衡**: 支持“号池管理” 按选择/权重的智能负载均衡，失败后切换下一权重站点
 
 ## 界面预览
 
@@ -28,14 +29,26 @@ CLP 是一个本地CLI代理工具，用于管理和代理AI服务（如Claude�
 - **多服务代理**: 支持Claude（端口3210）和Codex（端口3211）代理服务
 - **配置管理**: 支持多配置切换和管理
 - **Web UI界面**: 提供Web界面（端口3300）监控代理状态和使用统计
-- **请求过滤**: 内置请求过滤机制
-- **流式响应**: 支持流式API响应处理
-- **使用统计**: 自动记录和分析API使用情况
+- **三层请求过滤**:
+  - Endpoint 过滤：基于路径/方法/查询参数阻断请求
+  - Header 过滤：移除敏感请求头
+  - 请求体过滤：替换/移除敏感数据
+- **智能负载均衡**:
+  - active-first 模式：始终使用激活配置
+  - weight-based 模式：按权重选择，自动健康检查，多候选重试
+- **流式响应**:
+  - 支持 SSE（Server-Sent Events）
+  - 支持 NDJSON（Newline Delimited JSON）
+  - 逐块转发，无缓冲延迟
+- **使用统计**: 自动记录和分析API使用情况，实时解析流式响应中的 token 用量
 
 ### 📊 监控功能
-- 实时服务状态监控
-- API使用量统计
-- 请求/响应日志记录
+- 实时服务状态监控（WebSocket 推送）
+- 请求生命周期事件（started/streaming/completed）
+- 负载均衡切换事件（lb_switch/lb_reset/lb_exhausted）
+- 响应块实时推送
+- API使用量统计（自动解析 SSE/NDJSON）
+- 请求/响应日志记录（支持阻断信息审计）
 - 配置状态跟踪
 
 ## 技术栈
@@ -53,7 +66,8 @@ CLP 是一个本地CLI代理工具，用于管理和代理AI服务（如Claude�
 src/
 ├── main.py                     # 主入口文件
 ├── core/
-│   └── base_proxy.py          # 基础代理服务类
+│   ├── base_proxy.py          # 基础代理服务类（核心请求处理逻辑）
+│   └── realtime_hub.py        # WebSocket 实时事件广播
 ├── claude/
 │   ├── configs.py             # Claude配置管理
 │   ├── ctl.py                 # Claude服务控制器
@@ -66,16 +80,44 @@ src/
 │   ├── config_manager.py      # 配置管理器
 │   └── cached_config_manager.py # 缓存配置管理器
 ├── filter/
-│   ├── request_filter.py      # 请求过滤器
-│   └── cached_request_filter.py # 缓存请求过滤器
+│   ├── request_filter.py      # 请求体过滤器
+│   ├── cached_request_filter.py # 缓存请求过滤器
+│   ├── header_filter.py       # Header 过滤器
+│   ├── cached_header_filter.py # 缓存 Header 过滤器
+│   ├── endpoint_filter.py     # Endpoint 过滤器（最高优先级）
+│   └── cached_endpoint_filter.py # 缓存 Endpoint 过滤器
+├── auth/
+│   ├── auth_manager.py        # 鉴权管理器
+│   ├── token_generator.py     # Token 生成器
+│   ├── fastapi_middleware.py  # FastAPI 鉴权中间件
+│   └── flask_middleware.py    # Flask 鉴权中间件
 ├── ui/
 │   ├── ctl.py                 # UI服务控制器
 │   ├── ui_server.py           # Flask Web UI服务
 │   └── static/                # 静态资源文件
 └── utils/
     ├── platform_helper.py     # 平台工具
-    └── usage_parser.py        # 使用统计解析器
+    └── usage_parser.py        # 使用统计解析器（支持 SSE/NDJSON）
 ```
+
+### 核心架构说明
+
+**BaseProxyService** (`src/core/base_proxy.py`) 提供统一的代理服务实现：
+
+1. **请求处理流程**（7个阶段）：
+   - ① Endpoint 过滤 → ② 模型路由 → ③ 负载均衡选配置 → ④ 构建请求 → ⑤ 发送到上游 → ⑥ 处理响应（重试） → ⑦ 记录日志
+
+2. **负载均衡**：
+   - `active-first` 模式：始终使用激活配置，无重试
+   - `weight-based` 模式：按权重选择健康配置，支持两轮重试，失败计数自动重置（可配置冷却期）
+
+3. **流式响应**：
+   - 支持 SSE/NDJSON，逐块转发，无缓冲延迟
+   - 实时解析 usage 信息，广播 WebSocket 事件
+
+4. **日志系统**：
+   - 按服务拆分（`proxy_requests_{service}.jsonl`）
+   - 内存缓存 + 文件锁，保留最近 1000 条记录
 ## 快速开始
 
 ### 虚拟环境安装（推荐）
@@ -976,7 +1018,8 @@ def custom_filter(data: bytes) -> bytes:
 ### 请求接口过滤（endpoint_filter.json）
 
 - 位置：`~/.clp/endpoint_filter.json`
-- 作用：按“方法 + 路径(精确/前缀/正则) + 查询参数”匹配并阻断请求，不向上游转发；原始请求会被记录到本地日志用于审计；UI 提供可视化管理。
+- 作用：按"方法 + 路径(精确/前缀/正则) + 查询参数"匹配并阻断请求，不向上游转发；原始请求会被记录到本地日志用于审计；UI 提供可视化管理。
+- **优先级最高**：在模型路由和负载均衡之前判定，命中后立即返回错误，不消耗上游配额。
 
 最小示例（拦截 /api/v1/messages/count_tokens?beta=true）：
 
@@ -989,6 +1032,7 @@ def custom_filter(data: bytes) -> bytes:
       "services": ["claude", "codex"],
       "methods": ["GET", "POST"],
       "path": "/api/v1/messages/count_tokens",
+      "pathMatchType": "exact",
       "query": { "beta": "true" },
       "action": { "type": "block", "status": 403, "message": "count_tokens disabled" }
     }
@@ -996,24 +1040,45 @@ def custom_filter(data: bytes) -> bytes:
 }
 ```
 
-说明：`services` 缺省表示两者皆适用；`methods` 缺省为 `[*]` 任意；`query` 为 AND 关系，值为 `"*"` 表示“仅需存在”。命中后日志会包含 `blocked_by` 与 `blocked_reason` 字段，实时面板 `channel` 显示为 `blocked`。
+**配置说明**：
+- `services`：适用服务（缺省表示两者皆适用）
+- `methods`：HTTP 方法列表（缺省为 `["*"]` 任意方法）
+- `path`：匹配路径（始终带前导 `/`）
+- `pathMatchType`：匹配模式（`exact`/`prefix`/`regex`）
+- `query`：查询参数 AND 关系，值为 `"*"` 表示"仅需存在"
+- `action.status`：返回的 HTTP 状态码（推荐 403/451）
+- `action.message`：错误消息
+
+**命中后的行为**：
+- 日志包含 `blocked: true`、`blocked_by`（规则ID）、`blocked_reason`（消息）
+- 实时面板 `channel` 显示为 `blocked`
+- WebSocket 广播 `request_started` 和 `request_completed` 事件（`success: false`）
 
 ## 特性说明
 
 ### 异步处理
 - 使用FastAPI和httpx实现高性能异步代理
 - 支持并发请求处理
-- 优化的连接池管理
+- 优化的连接池管理（max_connections=200, max_keepalive_connections=100）
+- 使用 `asyncio.to_thread` 避免阻塞（日志记录、过滤器应用）
 
 ### 安全特性
-- 请求头过滤和标准化
-- 敏感信息过滤
-- 配置文件安全存储
+- 请求头过滤和标准化（移除 `authorization`、`host`、`content-length` 后重新设置）
+- 三层敏感信息过滤（Endpoint 阻断 → Header 过滤 → 请求体过滤）
+- 配置文件安全存储（`~/.clp/`）
+- 鉴权系统（Bearer Token，`clp_` 前缀区分代理层和上游层）
 
 ### 监控和日志
-- 详细的请求/响应日志
-- 使用量统计和分析
-- Web UI可视化监控
+- 详细的请求/响应日志（支持 Base64 编码的原始和过滤后内容）
+- 使用量统计和分析（自动解析 SSE/NDJSON 流式响应中的 usage 信息）
+- Web UI可视化监控（WebSocket 实时推送）
+- 日志轮转（保留最近 1000 条，按服务拆分）
+- 阻断请求审计（记录 `blocked_by`、`blocked_reason`）
+
+### 配置热重载
+- 基于文件签名检测（`st_mtime_ns + st_size`）
+- 无需重启服务即可生效
+- 适用范围：路由配置、负载均衡配置、所有过滤器、鉴权配置
 
 ## 许可证
 
