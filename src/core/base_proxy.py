@@ -15,12 +15,12 @@ import uuid
 from collections import deque
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from ..utils.usage_parser import (
     extract_usage_from_response,
@@ -88,6 +88,8 @@ class BaseProxyService(ABC):
 
         # 初始化FastAPI应用
         self.app = FastAPI()
+        # 鉴权白名单请求 - 本地处理而非转发
+        self.whitelist_paths: Set[str] = {'/health', '/ping', '/favicon.ico'}
         self._setup_routes()
         self.app.add_event_handler("shutdown", self._shutdown_event)
 
@@ -182,13 +184,90 @@ class BaseProxyService(ABC):
                 AuthMiddleware,
                 auth_manager=auth_manager,
                 service_name=self.service_name,
-                whitelist_paths={'/health', '/ping', '/favicon.ico'}
+                whitelist_paths=self.whitelist_paths
             )
         except ImportError as e:
             # 如果鉴权模块不存在，跳过（向后兼容）
             print(f"警告: 鉴权模块加载失败，将不启用鉴权功能: {e}")
         except Exception as e:
             print(f"警告: 鉴权中间件初始化失败: {e}")
+
+    def _build_whitelist_response(self, path: str) -> Response:
+        """构建白名单请求的本地响应"""
+        if path == '/health':
+            return JSONResponse({
+                "status": "ok",
+                "service": self.service_name,
+            })
+        if path == '/ping':
+            return JSONResponse({
+                "message": "pong",
+                "service": self.service_name,
+            })
+        if path == '/favicon.ico':
+            return Response(status_code=204)
+        return Response(status_code=404)
+
+    async def _handle_whitelisted_request(
+        self,
+        request: Request,
+        request_id: str,
+        path: str,
+        original_headers: Dict[str, str],
+        start_time: float,
+    ) -> Response:
+        """直接处理白名单请求，避免向上游转发"""
+        try:
+            await self.realtime_hub.request_started(
+                request_id=request_id,
+                method=request.method,
+                path=path,
+                channel="whitelist",
+                headers=original_headers,
+                target_url=None,
+            )
+        except Exception:
+            pass
+
+        response = self._build_whitelist_response(path)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        try:
+            await self.realtime_hub.request_completed(
+                request_id=request_id,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+                success=True,
+            )
+        except Exception:
+            pass
+
+        response_body = getattr(response, "body", None)
+        if isinstance(response_body, str):
+            response_content = response_body.encode('utf-8')
+        elif isinstance(response_body, (bytes, bytearray)):
+            response_content = bytes(response_body)
+        else:
+            response_content = None
+
+        try:
+            await self.log_request(
+                method=request.method,
+                path=path,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+                target_headers=None,
+                filtered_body=None,
+                original_headers=original_headers,
+                original_body=None,
+                response_content=response_content,
+                channel="whitelist",
+                target_url=None,
+            )
+        except Exception:
+            pass
+
+        return response
 
     async def log_request(
         self,
@@ -805,7 +884,18 @@ class BaseProxyService(ABC):
         start_time = time.time()
         request_id = str(uuid.uuid4())
 
+        full_path = request.url.path or '/'
         original_headers = {k: v for k, v in request.headers.items()}
+
+        if full_path in self.whitelist_paths:
+            return await self._handle_whitelisted_request(
+                request=request,
+                request_id=request_id,
+                path=full_path,
+                original_headers=original_headers,
+                start_time=start_time,
+            )
+
         original_body = await request.body()
 
         # —— 接口过滤：最先判定，命中则直接阻断 ——
@@ -813,7 +903,6 @@ class BaseProxyService(ABC):
             if self.endpoint_filter:
                 self.endpoint_filter.reload()
                 # 以 Request.url.path 作为匹配路径，始终带前导 '/'
-                full_path = request.url.path
                 # 将查询参数标准化为首值字典
                 qd = {}
                 try:
