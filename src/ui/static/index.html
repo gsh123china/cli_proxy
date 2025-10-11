@@ -15,7 +15,7 @@
             <header>
                 <h1>CLI Proxy 状态监控</h1>
                 <div class="refresh-info">
-                    <span>{{ lastUpdate }}</span>
+                    <span>下次刷新倒计时: {{ formatCountdown(autoRefreshCountdown) }} | {{ lastUpdate }}</span>
                     <el-button type="primary" @click="refreshData" :loading="loading" size="small">
                         刷新
                     </el-button>

@@ -1,5 +1,5 @@
 // Vue 3 + Element Plus CLI Proxy Monitor Application
-const { createApp, ref, reactive, computed, onMounted, nextTick, watch } = Vue;
+const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch } = Vue;
 const { ElMessage, ElMessageBox } = ElementPlus;
 
 const app = createApp({
@@ -12,6 +12,11 @@ const app = createApp({
         const filterSaving = ref(false);
         const headerFilterSaving = ref(false);       // Header Filter saving state（新增）
         const lastUpdate = ref('加载中...');
+        
+        // 自动刷新相关
+        const AUTO_REFRESH_INTERVAL = 300;      // 自动刷新间隔（秒，5分钟 = 300秒）
+        const autoRefreshCountdown = ref(AUTO_REFRESH_INTERVAL);  // 倒计时秒数，初始值为刷新间隔
+        const autoRefreshTimer = ref(null);     // setInterval 定时器引用
         
         // 服务状态数据
         const services = reactive({
@@ -1312,16 +1317,67 @@ const app = createApp({
             }
         };
         
-        // 刷新页面
-        const refreshData = () => {
-            window.location.reload();
+        // 格式化倒计时显示（分:秒）
+        const formatCountdown = (seconds) => {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        };
+
+        // 启动自动刷新定时器
+        const startAutoRefresh = () => {
+            stopAutoRefresh();  // 先清除可能存在的旧定时器
+            autoRefreshCountdown.value = AUTO_REFRESH_INTERVAL;
+            
+            autoRefreshTimer.value = setInterval(() => {
+                autoRefreshCountdown.value--;
+                
+                if (autoRefreshCountdown.value <= 0) {
+                    performAutoRefresh();  // 触发自动刷新
+                }
+            }, 1000);  // 每秒更新一次
+        };
+
+        // 停止自动刷新定时器
+        const stopAutoRefresh = () => {
+            if (autoRefreshTimer.value) {
+                clearInterval(autoRefreshTimer.value);
+                autoRefreshTimer.value = null;
+            }
+        };
+
+        // 执行自动刷新（局部数据刷新）
+        const performAutoRefresh = async () => {
+            try {
+                await loadData();  // 刷新数据，不重载页面
+                startAutoRefresh();  // 重启定时器
+            } catch (error) {
+                console.error('自动刷新失败:', error);
+                // 刷新失败也要重启定时器，避免停止工作
+                startAutoRefresh();
+            }
+        };
+        
+        // 刷新页面（局部数据刷新）
+        const refreshData = async () => {
+            stopAutoRefresh();  // 停止自动刷新
+            loading.value = true;
+            try {
+                await loadData();  // 局部数据刷新
+                ElMessage.success('数据已刷新');
+            } catch (error) {
+                ElMessage.error('刷新失败: ' + error.message);
+            } finally {
+                loading.value = false;
+                startAutoRefresh();  // 重启自动刷新
+            }
         };
         
         // 更新最后更新时间
         const updateLastUpdateTime = () => {
             const now = new Date();
             const timeString = now.toLocaleTimeString('zh-CN', { hour12: false });
-            lastUpdate.value = `最后更新: ${timeString}`;
+            lastUpdate.value = `上次刷新时刻: ${timeString}`;
         };
         
         // 配置切换
@@ -2489,6 +2545,13 @@ const app = createApp({
             loadData();
             // 初始化实时连接
             initRealTimeConnections();
+            // 启动自动刷新
+            startAutoRefresh();
+        });
+        
+        // 组件卸载前清理定时器
+        onBeforeUnmount(() => {
+            stopAutoRefresh();
         });
         
         return {
@@ -2499,6 +2562,11 @@ const app = createApp({
             configSaving,
             filterSaving,
             lastUpdate,
+            
+            // 自动刷新相关
+            autoRefreshCountdown,
+            formatCountdown,
+            
             services,
             stats,
             logs,
