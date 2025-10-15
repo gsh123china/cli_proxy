@@ -1,0 +1,172 @@
+---
+globs: **/proxy.py,**/core/*.py
+---
+
+# 代理服务架构规范
+
+## BaseProxyService 核心概念
+
+### 请求处理流程（7 个阶段）
+在 [src/core/base_proxy.py](mdc:src/core/base_proxy.py) 中定义，所有代理服务必须遵循：
+
+1. **Endpoint 过滤** - 最高优先级，命中即阻断请求
+2. **模型路由** - 映射源模型到目标模型（支持热重载）
+3. **负载均衡** - 选择健康配置（active-first/weight-based）
+4. **构建请求** - 应用 Header 过滤和请求体过滤
+5. **发送请求** - 使用 httpx 异步客户端转发
+6. **处理响应** - 支持流式（SSE/NDJSON），自动重试
+7. **记录日志** - 异步写入，包含完整请求生命周期
+
+### 负载均衡模式
+
+#### active-first 模式
+- 始终使用激活配置（`active=true`）
+- 失败后不重试
+- 适合单一主配置场景
+
+#### weight-based 模式
+- 按权重选择健康配置
+- 支持两轮重试（首轮随机选择，次轮遍历剩余）
+- 失败计数自动重置（可配置冷却期）
+- 健康检查：自动排除失败次数过多的配置
+
+### 三层过滤机制
+
+#### 1. Endpoint 过滤（最高优先级）
+```python
+# 在 proxy_request 开始时检查
+if endpoint_filter.should_block(request):
+    return JSONResponse(
+        status_code=403,
+        content={"error": "blocked"}
+    )
+```
+
+#### 2. Header 过滤
+```python
+# 构建请求时应用
+filtered_headers = header_filter.filter(request.headers)
+```
+
+#### 3. 请求体过滤
+```python
+# 构建请求时应用
+filtered_body = request_filter.filter(request_body)
+```
+
+### 流式响应处理
+
+#### SSE (Server-Sent Events)
+- Content-Type: `text/event-stream`
+- 格式: `data: {...}\n\n`
+- 实时解析 usage 信息
+
+#### NDJSON (Newline Delimited JSON)
+- Content-Type: `application/json` (流式)
+- 格式: `{...}\n`
+- 逐行解析 usage 信息
+
+#### 关键实现
+```python
+async def stream_response(upstream_response):
+    async for chunk in upstream_response.aiter_bytes():
+        # 1. 转发原始块
+        yield chunk
+        
+        # 2. 解析 usage（如果是流式响应）
+        usage = parse_usage_from_chunk(chunk)
+        
+        # 3. 广播 WebSocket 事件
+        await hub.broadcast({
+            "event": "chunk_received",
+            "usage": usage
+        })
+```
+
+### 日志系统
+
+#### 文件命名
+- 按服务拆分: `proxy_requests_{service}.jsonl`
+- 路径: `~/.clp/data/`
+
+#### 日志结构
+```python
+{
+    "timestamp": "2025-10-15T10:30:00Z",
+    "service": "claude",
+    "method": "POST",
+    "path": "/v1/messages",
+    "config_name": "prod",
+    "status_code": 200,
+    "request_body_base64": "...",  # 原始请求
+    "filtered_body_base64": "...",  # 过滤后请求
+    "response_body_base64": "...",
+    "usage": {...},
+    "blocked": false,  # 是否被 Endpoint 过滤阻断
+    "blocked_by": null,  # 阻断规则 ID
+    "blocked_reason": null  # 阻断原因
+}
+```
+
+#### 性能优化
+- 内存缓存（最近 1000 条）
+- 异步写入: `await asyncio.to_thread(write_log)`
+- 文件锁保护并发写入
+
+### WebSocket 实时事件
+
+使用 [src/core/realtime_hub.py](mdc:src/core/realtime_hub.py) 广播事件：
+
+#### 事件类型
+- `request_started` - 请求开始
+- `request_streaming` - 流式响应中
+- `request_completed` - 请求完成
+- `lb_switch` - 负载均衡切换配置
+- `lb_reset` - 失败计数重置
+- `lb_exhausted` - 所有配置失败
+
+#### 示例
+```python
+await self.hub.broadcast({
+    "event": "request_started",
+    "service": "claude",
+    "request_id": uuid.uuid4().hex,
+    "timestamp": datetime.now().isoformat()
+})
+```
+
+### 配置热重载
+
+基于文件签名（`st_mtime_ns + st_size`）自动检测配置变更：
+
+- 路由配置: `~/.clp/data/model_router_config.json`
+- 负载均衡: `~/.clp/data/lb_config.json`
+- 所有过滤器: `~/.clp/filter.json`, `~/.clp/endpoint_filter.json`
+- 鉴权配置: `~/.clp/auth.json`
+
+无需重启服务即可生效。
+
+### 实现新代理服务的步骤
+
+1. 创建服务目录: `src/your_service/`
+2. 继承 BaseProxyService:
+```python
+from src.core.base_proxy import BaseProxyService
+
+class YourServiceProxy(BaseProxyService):
+    def __init__(self):
+        super().__init__(
+            service_name="your_service",
+            default_port=3212
+        )
+```
+3. 创建配置管理器 (configs.py)
+4. 创建服务控制器 (ctl.py)
+5. 在 [src/main.py](mdc:src/main.py) 注册服务
+
+### 性能考虑
+
+- **连接池**: httpx 客户端配置 `max_connections=200`, `max_keepalive_connections=100`
+- **异步 I/O**: 所有网络和文件操作使用 async/await
+- **避免阻塞**: CPU 密集型操作使用 `asyncio.to_thread`
+- **流式转发**: 无缓冲，逐块转发，降低内存占用

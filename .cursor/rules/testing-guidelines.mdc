@@ -1,0 +1,250 @@
+---
+globs: tests/**/*.py
+---
+
+# 测试规范与指南
+
+## 测试框架
+- **主框架**: pytest
+- **异步测试**: pytest-asyncio
+- **覆盖率**: pytest-cov (建议 ≥70%)
+- **HTTP 测试**: httpx.AsyncClient
+
+## 测试目录结构
+```
+tests/
+├── unit/           # 单元测试（工具函数、过滤器）
+│   ├── test_filters.py
+│   ├── test_utils.py
+│   └── test_config.py
+└── integration/    # 集成测试（FastAPI 路径、完整流程）
+    ├── test_claude_proxy.py
+    └── test_codex_proxy.py
+```
+
+## 测试文件命名
+- 文件名: `test_*.py`
+- 测试函数: `test_*` 或 `test_*_async`
+- 测试类: `Test*` (可选)
+
+## 运行测试
+
+### 激活虚拟环境
+```bash
+# 必须先激活虚拟环境
+source clp-env/bin/activate
+```
+
+### 基本命令
+```bash
+# 运行所有测试
+pytest -q
+
+# 运行特定目录
+pytest tests/unit/ -v
+
+# 运行特定文件
+pytest tests/unit/test_filters.py -v
+
+# 运行特定测试
+pytest tests/unit/test_filters.py::test_endpoint_filter -v
+
+# 查看覆盖率
+pytest --cov=src --cov-report=html
+```
+
+## 单元测试示例
+
+### 测试工具函数
+```python
+import pytest
+from src.utils.usage_parser import parse_usage_from_sse
+
+def test_parse_usage_from_sse():
+    """测试 SSE 格式的 usage 解析"""
+    sse_data = b'data: {"usage":{"input_tokens":10,"output_tokens":20}}\n\n'
+    
+    result = parse_usage_from_sse(sse_data)
+    
+    assert result is not None
+    assert result["input_tokens"] == 10
+    assert result["output_tokens"] == 20
+```
+
+### 测试过滤器
+```python
+from src.filter.endpoint_filter import EndpointFilter
+
+def test_endpoint_filter_block():
+    """测试 Endpoint 过滤器阻断功能"""
+    config = {
+        "enabled": True,
+        "rules": [{
+            "id": "test-rule",
+            "services": ["claude"],
+            "methods": ["POST"],
+            "path": "/v1/messages",
+            "pathMatchType": "exact",
+            "action": {"type": "block", "status": 403}
+        }]
+    }
+    
+    filter = EndpointFilter("claude", config)
+    
+    # 模拟请求
+    class MockRequest:
+        method = "POST"
+        url = type('obj', (object,), {'path': '/v1/messages', 'query': ''})()
+    
+    assert filter.should_block(MockRequest()) == True
+```
+
+## 集成测试示例
+
+### 测试 FastAPI 端点
+```python
+import pytest
+from httpx import AsyncClient
+from src.claude.proxy import app
+
+@pytest.mark.asyncio
+async def test_proxy_endpoint():
+    """测试代理端点完整流程"""
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 100
+            },
+            headers={"x-api-key": "test-key"}
+        )
+        
+        # 验证响应
+        assert response.status_code in [200, 403]  # 可能被过滤器阻断
+```
+
+### 测试流式响应
+```python
+@pytest.mark.asyncio
+async def test_streaming_response():
+    """测试流式响应处理"""
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/messages",
+            json={"model": "claude-3-5-sonnet-20241022", "messages": [...]}
+        ) as response:
+            chunks = []
+            async for chunk in response.aiter_bytes():
+                chunks.append(chunk)
+            
+            assert len(chunks) > 0
+            # 验证 SSE 格式
+            assert b"data:" in chunks[0]
+```
+
+## 测试最佳实践
+
+### 避免固定端口
+```python
+# 错误 - 会占用真实端口
+app.run(host="127.0.0.1", port=3210)
+
+# 正确 - 使用 ASGI 测试客户端
+async with AsyncClient(app=app, base_url="http://test") as client:
+    response = await client.get("/health")
+```
+
+### 隔离测试数据
+```python
+import tempfile
+import pytest
+
+@pytest.fixture
+def temp_config_dir():
+    """使用临时目录而非 ~/.clp"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
+```
+
+### Mock 外部依赖
+```python
+from unittest.mock import patch, AsyncMock
+
+@pytest.mark.asyncio
+@patch("httpx.AsyncClient.post")
+async def test_upstream_request(mock_post):
+    """Mock 上游 API 响应"""
+    mock_post.return_value = AsyncMock(
+        status_code=200,
+        json=lambda: {"id": "msg_123", "content": [{"text": "Hello"}]}
+    )
+    
+    # 测试代理逻辑
+    result = await proxy_request(...)
+    assert result.status_code == 200
+```
+
+### 测试异步函数
+```python
+import pytest
+
+@pytest.mark.asyncio
+async def test_async_function():
+    """测试异步函数"""
+    result = await some_async_function()
+    assert result is not None
+```
+
+## 测试覆盖目标
+
+### 必须测试的部分
+- ✅ 过滤器逻辑（Endpoint/Header/RequestBody）
+- ✅ 负载均衡选择算法
+- ✅ 模型路由映射
+- ✅ 配置热重载
+- ✅ 请求处理流程（各个阶段）
+- ✅ 流式响应解析（SSE/NDJSON）
+
+### 可选测试的部分
+- 日志写入（文件 I/O）
+- WebSocket 广播（实时事件）
+- UI 界面渲染
+
+### 不建议测试的部分
+- 第三方库内部逻辑
+- 外部 API 响应（应该 Mock）
+
+## 持续集成建议
+```yaml
+# .github/workflows/test.yml 示例
+name: Tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - run: pip install -e .[dev]
+      - run: pytest --cov=src --cov-report=xml
+      - uses: codecov/codecov-action@v3  # 上传覆盖率报告
+```
+
+## 常见问题
+
+### 测试卡住不结束
+- 原因: 异步资源未正确清理
+- 解决: 使用 `async with` 或在 `finally` 中关闭客户端
+
+### 测试文件找不到
+- 原因: 导入路径错误
+- 解决: 使用绝对导入 `from src.* import ...`
+
+### 测试数据冲突
+- 原因: 多个测试共享全局状态
+- 解决: 使用 pytest fixture 隔离数据

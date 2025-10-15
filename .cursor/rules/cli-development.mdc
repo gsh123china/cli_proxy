@@ -1,0 +1,518 @@
+---
+globs: src/main.py,**/ctl.py
+---
+
+# CLI 开发规范
+
+## CLI 框架
+
+CLP 使用 [Typer](https://typer.tiangolo.com/) 构建命令行界面。
+
+入口文件: [src/main.py](mdc:src/main.py)
+
+## 基本结构
+
+```python
+import typer
+from typing import Optional
+
+app = typer.Typer(
+    name="clp",
+    help="CLP - 本地 AI 代理工具",
+    no_args_is_help=True
+)
+
+@app.command()
+def start():
+    """启动所有服务"""
+    print("启动服务...")
+
+@app.command()
+def stop():
+    """停止所有服务"""
+    print("停止服务...")
+
+if __name__ == "__main__":
+    app()
+```
+
+## 命令定义规范
+
+### 命令命名
+- 使用小写字母和连字符
+- 简洁明了，易于记忆
+- 符合 Unix 命令习惯
+
+```python
+# 好的命令名
+@app.command("start")       # clp start
+@app.command("list")        # clp list
+@app.command("active")      # clp active
+
+# 不好的命令名
+@app.command("startService")  # 驼峰命名
+@app.command("ls")            # 过度简化
+```
+
+### 帮助文档
+每个命令必须包含清晰的帮助信息：
+
+```python
+@app.command()
+def active(
+    service: str = typer.Argument(
+        ...,
+        help="服务名称 (claude/codex)"
+    ),
+    name: str = typer.Argument(
+        ...,
+        help="配置名称"
+    )
+):
+    """
+    激活指定服务的配置（热切换，无需重启）
+    
+    示例:
+        clp active claude prod
+        clp active codex backup
+    """
+    pass
+```
+
+### 参数和选项
+
+#### 位置参数（Argument）
+```python
+@app.command()
+def active(
+    service: str = typer.Argument(..., help="服务名称"),
+    name: str = typer.Argument(..., help="配置名称")
+):
+    """激活配置"""
+    pass
+
+# 使用: clp active claude prod
+```
+
+#### 可选参数（Option）
+```python
+@app.command()
+def list(
+    service: str = typer.Argument(..., help="服务名称"),
+    include_deleted: bool = typer.Option(
+        False,
+        "--include-deleted",
+        "-d",
+        help="包含已禁用的配置"
+    )
+):
+    """列出配置"""
+    pass
+
+# 使用: clp list claude --include-deleted
+# 或: clp list claude -d
+```
+
+#### 默认值
+```python
+@app.command()
+def generate(
+    name: str = typer.Option(..., help="Token 名称"),
+    services: list[str] = typer.Option(..., help="服务列表"),
+    description: str = typer.Option("", help="描述"),
+    expires: Optional[str] = typer.Option(None, help="过期时间")
+):
+    """生成 Token"""
+    pass
+```
+
+## 子命令（Command Group）
+
+对于复杂的命令集，使用子命令：
+
+```python
+# 创建子命令组
+auth_app = typer.Typer(help="鉴权管理")
+
+@auth_app.command()
+def on():
+    """启用鉴权"""
+    pass
+
+@auth_app.command()
+def off():
+    """关闭鉴权"""
+    pass
+
+@auth_app.command()
+def generate():
+    """生成 Token"""
+    pass
+
+@auth_app.command()
+def list():
+    """列出所有 Token"""
+    pass
+
+# 注册到主应用
+app.add_typer(auth_app, name="auth")
+```
+
+使用方式：
+```bash
+clp auth on
+clp auth generate --name prod --services claude codex
+clp auth list
+```
+
+## 输出格式规范
+
+### 成功消息
+```python
+print("✓ 服务启动成功")
+print("✓ 配置已保存")
+```
+
+### 错误消息
+```python
+print("✗ 服务启动失败")
+print(f"✗ 配置 {name} 不存在")
+```
+
+### 警告消息
+```python
+print("⚠ 端口 3210 已被占用")
+print("⚠ 未找到配置文件，将使用默认配置")
+```
+
+### 信息消息
+```python
+print("ℹ 正在启动服务...")
+print(f"ℹ 使用配置: {config_name}")
+```
+
+### 表格输出
+```python
+# 对齐的表格
+print(f"{'名称':<15} {'状态':<8} {'端口':<6} {'PID':<8}")
+print("-" * 45)
+print(f"{'Claude':<15} {'运行中':<8} {3210:<6} {12345:<8}")
+print(f"{'Codex':<15} {'已停止':<8} {3211:<6} {'-':<8}")
+```
+
+### 彩色输出（可选）
+```python
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+# 彩色文本
+console.print("[green]✓[/green] 成功")
+console.print("[red]✗[/red] 失败")
+console.print("[yellow]⚠[/yellow] 警告")
+
+# 表格
+table = Table(title="服务状态")
+table.add_column("服务", style="cyan")
+table.add_column("状态", style="magenta")
+table.add_row("Claude", "运行中")
+table.add_row("Codex", "已停止")
+console.print(table)
+```
+
+## 错误处理
+
+### 使用 typer.Exit
+```python
+@app.command()
+def active(service: str, name: str):
+    """激活配置"""
+    valid_services = ["claude", "codex"]
+    
+    if service not in valid_services:
+        print(f"✗ 无效的服务名称: {service}")
+        print(f"  有效服务: {', '.join(valid_services)}")
+        raise typer.Exit(1)  # 退出码 1 表示错误
+    
+    # 执行操作...
+    print(f"✓ 已激活 {service} 配置: {name}")
+```
+
+### 捕获异常
+```python
+@app.command()
+def start():
+    """启动服务"""
+    try:
+        start_services()
+        print("✓ 所有服务已启动")
+    except PermissionError:
+        print("✗ 权限不足，请使用 sudo 或管理员权限运行")
+        raise typer.Exit(1)
+    except OSError as e:
+        print(f"✗ 启动失败: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print(f"✗ 未知错误: {e}")
+        raise typer.Exit(1)
+```
+
+### 确认提示
+```python
+@app.command()
+def remove(name: str):
+    """删除配置"""
+    if not typer.confirm(f"确定要删除配置 '{name}' 吗？"):
+        print("已取消")
+        raise typer.Exit()
+    
+    # 执行删除...
+    print(f"✓ 已删除配置: {name}")
+```
+
+## 服务控制器基类
+
+每个服务的控制器继承自 BaseServiceController：
+
+```python
+from src.core.base_proxy import BaseServiceController
+
+class ClaudeController(BaseServiceController):
+    def __init__(self):
+        super().__init__(
+            service_name="claude",
+            proxy_module="src.claude.proxy",
+            default_port=3210
+        )
+    
+    def start(self):
+        """启动服务"""
+        return super().start()
+    
+    def stop(self):
+        """停止服务"""
+        return super().stop()
+    
+    def status(self):
+        """获取服务状态"""
+        return super().status()
+    
+    def restart(self):
+        """重启服务"""
+        return super().restart()
+```
+
+## CLI 命令实现模式
+
+### 1. 启动服务
+```python
+@app.command()
+def start():
+    """启动所有代理服务"""
+    from src.claude.ctl import ClaudeController
+    from src.codex.ctl import CodexController
+    from src.ui.ctl import UIController
+    
+    controllers = {
+        "Claude": ClaudeController(),
+        "Codex": CodexController(),
+        "UI": UIController()
+    }
+    
+    print("正在启动服务...")
+    
+    for name, controller in controllers.items():
+        try:
+            if controller.start():
+                print(f"✓ {name} 服务已启动")
+            else:
+                print(f"⚠ {name} 服务已在运行")
+        except Exception as e:
+            print(f"✗ {name} 服务启动失败: {e}")
+```
+
+### 2. 停止服务
+```python
+@app.command()
+def stop():
+    """停止所有代理服务"""
+    from src.claude.ctl import ClaudeController
+    from src.codex.ctl import CodexController
+    from src.ui.ctl import UIController
+    
+    controllers = {
+        "Claude": ClaudeController(),
+        "Codex": CodexController(),
+        "UI": UIController()
+    }
+    
+    print("正在停止服务...")
+    
+    for name, controller in controllers.items():
+        try:
+            if controller.stop():
+                print(f"✓ {name} 服务已停止")
+            else:
+                print(f"⚠ {name} 服务未运行")
+        except Exception as e:
+            print(f"✗ {name} 服务停止失败: {e}")
+```
+
+### 3. 查看状态
+```python
+@app.command()
+def status():
+    """查看所有服务状态"""
+    from src.claude.ctl import ClaudeController
+    from src.codex.ctl import CodexController
+    from src.ui.ctl import UIController
+    
+    controllers = {
+        "Claude": ClaudeController(),
+        "Codex": CodexController(),
+        "UI": UIController()
+    }
+    
+    print("=== CLP 服务状态 ===")
+    print()
+    print(f"{'服务':<10} {'状态':<10} {'端口':<6} {'PID':<8}")
+    print("-" * 40)
+    
+    for name, controller in controllers.items():
+        status_info = controller.status()
+        
+        if status_info["running"]:
+            status_str = "运行中"
+            pid = status_info.get("pid", "-")
+        else:
+            status_str = "已停止"
+            pid = "-"
+        
+        port = status_info.get("port", "-")
+        
+        print(f"{name:<10} {status_str:<10} {port:<6} {pid:<8}")
+```
+
+### 4. 配置管理
+```python
+@app.command()
+def list(
+    service: str = typer.Argument(..., help="服务名称 (claude/codex)"),
+    include_deleted: bool = typer.Option(
+        False,
+        "--include-deleted",
+        "-d",
+        help="包含已禁用的配置"
+    )
+):
+    """列出配置"""
+    from src.config.config_manager import get_config_manager
+    
+    valid_services = ["claude", "codex"]
+    if service not in valid_services:
+        print(f"✗ 无效的服务名称: {service}")
+        print(f"  有效服务: {', '.join(valid_services)}")
+        raise typer.Exit(1)
+    
+    manager = get_config_manager(service)
+    configs = manager.get_configs(include_deleted)
+    
+    if not configs:
+        print(f"暂无 {service} 配置")
+        return
+    
+    print(f"=== {service.upper()} 配置列表 ===")
+    print()
+    print(f"{'激活':<4} {'名称':<15} {'URL':<40} {'权重':<6} {'状态':<8}")
+    print("-" * 80)
+    
+    for name, config in configs.items():
+        active = "★" if config.get("active") else " "
+        url = config["base_url"]
+        weight = config.get("weight", 100)
+        
+        if config.get("deleted"):
+            status = "已禁用"
+        else:
+            status = "正常"
+        
+        print(f"{active:<4} {name:<15} {url:<40} {weight:<6} {status:<8}")
+```
+
+## 环境变量支持
+
+```python
+import os
+
+@app.command()
+def start():
+    """启动服务"""
+    # 读取环境变量
+    ui_host = os.getenv("CLP_UI_HOST", "127.0.0.1")
+    proxy_host = os.getenv("CLP_PROXY_HOST", "127.0.0.1")
+    
+    print(f"UI 监听地址: {ui_host}:3300")
+    print(f"代理监听地址: {proxy_host}:3210,3211")
+    
+    # 启动服务...
+```
+
+## 配置文件路径处理
+
+```python
+import os
+from pathlib import Path
+
+def get_config_path(filename: str) -> Path:
+    """获取配置文件路径"""
+    config_dir = Path.home() / ".clp"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / filename
+
+# 使用示例
+claude_config = get_config_path("claude.json")
+filter_config = get_config_path("filter.json")
+```
+
+## 测试 CLI 命令
+
+```python
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+def test_start_command():
+    """测试 start 命令"""
+    result = runner.invoke(app, ["start"])
+    
+    assert result.exit_code == 0
+    assert "启动" in result.stdout
+
+def test_list_command():
+    """测试 list 命令"""
+    result = runner.invoke(app, ["list", "claude"])
+    
+    assert result.exit_code == 0
+    assert "配置列表" in result.stdout
+
+def test_invalid_service():
+    """测试无效服务名"""
+    result = runner.invoke(app, ["list", "invalid"])
+    
+    assert result.exit_code == 1
+    assert "无效" in result.stdout
+```
+
+## 最佳实践
+
+- ✅ 每个命令包含清晰的帮助文档和示例
+- ✅ 使用位置参数处理必需参数，选项处理可选参数
+- ✅ 提供简短和完整两种选项形式（如 `-d` 和 `--include-deleted`）
+- ✅ 错误消息明确，提供解决建议
+- ✅ 使用符号（✓ ✗ ⚠ ℹ）增强可读性
+- ✅ 危险操作添加确认提示（如删除配置）
+- ✅ 表格输出对齐，便于阅读
+- ✅ 支持环境变量覆盖默认配置
+- ✅ 退出码规范（0 = 成功，1 = 错误）
+- ✅ 命令执行前验证参数有效性

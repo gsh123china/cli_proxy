@@ -1,0 +1,263 @@
+---
+globs: **/configs.py,**/config_manager.py
+---
+
+# 配置管理规范
+
+## 配置文件位置
+- Claude: `~/.clp/claude.json`
+- Codex: `~/.clp/codex.json`
+- 过滤器: `~/.clp/filter.json`
+- Endpoint 过滤: `~/.clp/endpoint_filter.json`
+- 鉴权: `~/.clp/auth.json`
+- 模型路由: `~/.clp/data/model_router_config.json`
+- 负载均衡: `~/.clp/data/lb_config.json`
+
+## 配置结构示例
+
+### 服务配置 (claude.json / codex.json)
+```json
+{
+  "prod": {
+    "base_url": "https://api.example.com",
+    "auth_token": "sk-ant-***",
+    "weight": 100,
+    "active": true,
+    "deleted": false,
+    "deleted_at": null
+  },
+  "backup": {
+    "base_url": "https://backup.example.com",
+    "auth_token": "sk-ant-***",
+    "weight": 50,
+    "active": false,
+    "deleted": true,
+    "deleted_at": "2025-10-07T03:25:00Z"
+  }
+}
+```
+
+### 配置字段说明
+- `base_url` (必需): 上游 API 地址
+- `auth_token` (必需): 认证 Token
+- `weight` (可选): 负载均衡权重，默认 100
+- `active` (可选): 是否为激活配置，默认 false
+- `deleted` (可选): 逻辑删除标记，默认 false
+- `deleted_at` (可选): 删除时间戳（ISO8601）
+
+## 逻辑删除机制
+
+### 禁用配置
+```bash
+clp disable codex backup
+```
+- 设置 `deleted: true`
+- 记录 `deleted_at` 时间戳
+- 配置不会用于路由和负载均衡
+- 清理负载均衡状态中的失败计数
+
+### 恢复配置
+```bash
+clp enable codex backup
+```
+- 设置 `deleted: false`
+- 保留 `deleted_at` 记录（审计用途）
+- 配置重新参与路由和负载均衡
+
+### 代码实现
+```python
+def disable_config(self, name: str) -> None:
+    """禁用配置（逻辑删除）"""
+    if name not in self.configs:
+        raise ValueError(f"配置 {name} 不存在")
+    
+    self.configs[name]["deleted"] = True
+    self.configs[name]["deleted_at"] = datetime.now().isoformat()
+    self.save_configs()
+
+def get_active_configs(self) -> Dict[str, Any]:
+    """获取所有未删除的配置"""
+    return {
+        name: config
+        for name, config in self.configs.items()
+        if not config.get("deleted", False)
+    }
+```
+
+## 配置管理器基类
+
+继承 [src/config/config_manager.py](mdc:src/config/config_manager.py) 的 `ConfigManager`：
+
+```python
+from src.config.config_manager import ConfigManager
+
+class ClaudeConfigManager(ConfigManager):
+    def __init__(self):
+        super().__init__(
+            config_file="~/.clp/claude.json",
+            service_name="claude"
+        )
+    
+    # 可选：添加服务特定的配置验证
+    def validate_config(self, config: dict) -> bool:
+        """验证配置格式"""
+        required_fields = ["base_url", "auth_token"]
+        return all(field in config for field in required_fields)
+```
+
+## 缓存配置管理器
+
+使用 [src/config/cached_config_manager.py](mdc:src/config/cached_config_manager.py) 实现热重载：
+
+```python
+from src.config.cached_config_manager import CachedConfigManager
+
+class ClaudeConfigManager(CachedConfigManager):
+    def __init__(self):
+        super().__init__(
+            config_file="~/.clp/claude.json",
+            service_name="claude"
+        )
+    
+    def get_configs(self) -> Dict[str, Any]:
+        """获取配置（自动检测文件变更）"""
+        return self._get_cached_configs()
+```
+
+### 热重载机制
+- 基于文件签名: `st_mtime_ns + st_size`
+- 自动检测配置文件变更
+- 无需重启服务即可生效
+
+## 配置选择策略
+
+### Active-First 模式
+```python
+def get_active_config(self) -> Optional[dict]:
+    """获取激活配置"""
+    for name, config in self.configs.items():
+        if config.get("active") and not config.get("deleted"):
+            return {"name": name, "config": config}
+    return None
+```
+
+### Weight-Based 模式
+```python
+def select_by_weight(self) -> Optional[dict]:
+    """按权重随机选择健康配置"""
+    available = [
+        (name, config)
+        for name, config in self.configs.items()
+        if not config.get("deleted")
+        and not self.is_excluded(name)
+    ]
+    
+    if not available:
+        return None
+    
+    weights = [config.get("weight", 100) for _, config in available]
+    selected_name, selected_config = random.choices(
+        available,
+        weights=weights,
+        k=1
+    )[0]
+    
+    return {"name": selected_name, "config": selected_config}
+```
+
+## 负载均衡状态管理
+
+在 [src/core/base_proxy.py](mdc:src/core/base_proxy.py) 中维护：
+
+```python
+self.lb_state = {
+    "failure_counts": {},     # 每个配置的失败计数
+    "excluded": set(),        # 当前排除的配置
+    "last_reset": None,       # 上次重置时间
+    "cooldown_until": {}      # 每个配置的冷却截止时间
+}
+```
+
+### 失败计数与重置
+```python
+def increment_failure(self, config_name: str) -> None:
+    """增加失败计数"""
+    self.lb_state["failure_counts"][config_name] = \
+        self.lb_state["failure_counts"].get(config_name, 0) + 1
+    
+    # 失败次数过多，加入排除列表
+    if self.lb_state["failure_counts"][config_name] >= 3:
+        self.lb_state["excluded"].add(config_name)
+
+def reset_failures(self) -> None:
+    """重置所有失败计数（冷却期后）"""
+    now = datetime.now()
+    cooldown = self.lb_config.get("reset_cooldown_seconds", 300)
+    
+    if self.lb_state["last_reset"]:
+        elapsed = (now - self.lb_state["last_reset"]).total_seconds()
+        if elapsed < cooldown:
+            return
+    
+    self.lb_state["failure_counts"].clear()
+    self.lb_state["excluded"].clear()
+    self.lb_state["last_reset"] = now
+```
+
+## 配置验证
+
+### 必需字段检查
+```python
+def validate_config(config: dict) -> List[str]:
+    """验证配置，返回错误列表"""
+    errors = []
+    
+    if "base_url" not in config:
+        errors.append("缺少 base_url 字段")
+    elif not config["base_url"].startswith("http"):
+        errors.append("base_url 必须以 http:// 或 https:// 开头")
+    
+    if "auth_token" not in config:
+        errors.append("缺少 auth_token 字段")
+    elif len(config["auth_token"]) < 10:
+        errors.append("auth_token 长度不足")
+    
+    weight = config.get("weight", 100)
+    if not isinstance(weight, int) or weight < 0:
+        errors.append("weight 必须是非负整数")
+    
+    return errors
+```
+
+## CLI 配置管理命令
+
+参考 [src/main.py](mdc:src/main.py) 实现：
+
+```python
+@app.command()
+def list(service: str, include_deleted: bool = False):
+    """列出配置"""
+    manager = get_config_manager(service)
+    configs = manager.get_configs(include_deleted)
+    
+    for name, config in configs.items():
+        status = "已禁用" if config.get("deleted") else "正常"
+        active = "★" if config.get("active") else " "
+        print(f"{active} {name}: {config['base_url']} ({status})")
+
+@app.command()
+def active(service: str, name: str):
+    """激活配置（热切换）"""
+    manager = get_config_manager(service)
+    manager.set_active(name)
+    print(f"✓ 已激活 {service} 配置: {name}")
+```
+
+## 最佳实践
+
+- ✅ 使用 `CachedConfigManager` 实现配置热重载
+- ✅ 禁用而非删除配置（保留 `deleted_at` 用于审计）
+- ✅ 验证配置字段完整性和格式
+- ✅ 使用逻辑删除机制，避免数据丢失
+- ✅ 配置变更后自动清理相关状态（如负载均衡失败计数）
+- ✅ 敏感字段（auth_token）不打印到日志

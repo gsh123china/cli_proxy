@@ -1,0 +1,368 @@
+---
+globs: **/filter/*.py
+---
+
+# 过滤器系统规范
+
+## 三层过滤机制
+
+CLP 提供三层过滤保护，优先级从高到低：
+
+1. **Endpoint 过滤** - 阻断特定请求路径
+2. **Header 过滤** - 移除敏感请求头
+3. **请求体过滤** - 替换/移除敏感数据
+
+## Endpoint 过滤器（最高优先级）
+
+### 配置文件
+位置: `~/.clp/endpoint_filter.json`
+
+### 配置结构
+```json
+{
+  "enabled": true,
+  "rules": [
+    {
+      "id": "block-count-tokens",
+      "services": ["claude", "codex"],
+      "methods": ["GET", "POST"],
+      "path": "/api/v1/messages/count_tokens",
+      "pathMatchType": "exact",
+      "query": { "beta": "true" },
+      "action": {
+        "type": "block",
+        "status": 403,
+        "message": "count_tokens disabled"
+      }
+    }
+  ]
+}
+```
+
+### 字段说明
+- `id`: 规则唯一标识符
+- `services`: 适用服务列表，缺省表示所有服务
+- `methods`: HTTP 方法列表，缺省为 `["*"]`（所有方法）
+- `path`: 匹配路径（始终带前导 `/`）
+- `pathMatchType`: 匹配模式
+  - `exact`: 精确匹配
+  - `prefix`: 前缀匹配
+  - `regex`: 正则表达式匹配
+- `query`: 查询参数（AND 关系），值为 `"*"` 表示"仅需存在"
+- `action.type`: 动作类型（目前仅支持 `block`）
+- `action.status`: HTTP 状态码（推荐 403 或 451）
+- `action.message`: 错误消息
+
+### 实现要点
+```python
+from src.filter.endpoint_filter import EndpointFilter
+
+class EndpointFilter:
+    def __init__(self, service_name: str, config: dict):
+        self.service_name = service_name
+        self.config = config
+    
+    def should_block(self, request: Request) -> bool:
+        """检查请求是否应被阻断"""
+        if not self.config.get("enabled"):
+            return False
+        
+        for rule in self.config.get("rules", []):
+            if self._match_rule(rule, request):
+                return True
+        
+        return False
+    
+    def _match_rule(self, rule: dict, request: Request) -> bool:
+        """检查规则是否匹配"""
+        # 1. 检查服务
+        if "services" in rule and self.service_name not in rule["services"]:
+            return False
+        
+        # 2. 检查方法
+        methods = rule.get("methods", ["*"])
+        if "*" not in methods and request.method not in methods:
+            return False
+        
+        # 3. 检查路径
+        if not self._match_path(rule, request.url.path):
+            return False
+        
+        # 4. 检查查询参数
+        if "query" in rule and not self._match_query(rule["query"], request.url.query):
+            return False
+        
+        return True
+```
+
+### 阻断后的行为
+- 返回指定的 HTTP 状态码（如 403）
+- 日志记录包含 `blocked: true`, `blocked_by`, `blocked_reason`
+- WebSocket 广播 `request_started` 和 `request_completed` 事件
+- 请求不转发到上游，不消耗配额
+
+## Header 过滤器
+
+### 配置文件
+位置: `~/.clp/filter.json` (共享配置)
+
+### 配置结构
+```json
+{
+  "header_filters": {
+    "enabled": true,
+    "remove_headers": [
+      "user-agent",
+      "x-real-ip",
+      "x-forwarded-for"
+    ]
+  }
+}
+```
+
+### 实现示例
+```python
+from src.filter.header_filter import HeaderFilter
+
+class HeaderFilter:
+    def __init__(self, config: dict):
+        self.config = config
+    
+    def filter(self, headers: dict) -> dict:
+        """过滤请求头"""
+        if not self.config.get("enabled"):
+            return headers
+        
+        remove_list = self.config.get("remove_headers", [])
+        
+        # 创建新字典，排除指定的 header
+        filtered = {
+            k: v for k, v in headers.items()
+            if k.lower() not in [h.lower() for h in remove_list]
+        }
+        
+        return filtered
+```
+
+### 默认过滤的 Header
+BaseProxyService 在构建请求时自动移除：
+- `authorization` - 避免泄露原始认证信息
+- `host` - 避免主机名错误
+- `content-length` - 由 httpx 自动计算
+
+## 请求体过滤器
+
+### 配置文件
+位置: `~/.clp/filter.json` (共享配置)
+
+### 配置结构
+```json
+{
+  "request_body_filters": {
+    "enabled": true,
+    "rules": [
+      {
+        "path": "$.metadata.user_id",
+        "action": "remove"
+      },
+      {
+        "path": "$.system[*].cache_control",
+        "action": "replace",
+        "value": {"type": "ephemeral"}
+      }
+    ]
+  }
+}
+```
+
+### JSONPath 支持
+- `$.field` - 根级别字段
+- `$.nested.field` - 嵌套字段
+- `$.array[*]` - 数组所有元素
+- `$.array[0]` - 数组特定索引
+
+### 实现示例
+```python
+import json
+from jsonpath_ng import parse
+
+class RequestFilter:
+    def __init__(self, config: dict):
+        self.config = config
+    
+    def filter(self, body: bytes) -> bytes:
+        """过滤请求体"""
+        if not self.config.get("enabled"):
+            return body
+        
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        
+        for rule in self.config.get("rules", []):
+            data = self._apply_rule(data, rule)
+        
+        return json.dumps(data).encode()
+    
+    def _apply_rule(self, data: dict, rule: dict) -> dict:
+        """应用单条过滤规则"""
+        path_expr = parse(rule["path"])
+        action = rule["action"]
+        
+        if action == "remove":
+            # 删除匹配的字段
+            for match in path_expr.find(data):
+                match.full_path.update_or_create(data, None)
+        
+        elif action == "replace":
+            # 替换匹配的字段
+            value = rule["value"]
+            for match in path_expr.find(data):
+                match.full_path.update(data, value)
+        
+        return data
+```
+
+## 缓存过滤器
+
+所有过滤器都应继承缓存基类，实现配置热重载：
+
+```python
+from src.filter.cached_endpoint_filter import CachedEndpointFilter
+
+class EndpointFilter(CachedEndpointFilter):
+    def __init__(self, service_name: str):
+        super().__init__(
+            config_file="~/.clp/endpoint_filter.json",
+            service_name=service_name
+        )
+    
+    def should_block(self, request: Request) -> bool:
+        """使用缓存配置检查"""
+        config = self._get_cached_config()
+        return self._check_with_config(config, request)
+```
+
+### 文件签名检测
+```python
+def _get_file_signature(self, filepath: str) -> str:
+    """获取文件签名（用于检测变更）"""
+    stat = os.stat(filepath)
+    return f"{stat.st_mtime_ns}_{stat.st_size}"
+
+def _get_cached_config(self) -> dict:
+    """获取缓存配置（自动检测变更）"""
+    current_sig = self._get_file_signature(self.config_file)
+    
+    if current_sig != self._last_signature:
+        # 文件已变更，重新加载
+        with open(self.config_file, 'r') as f:
+            self._cached_config = json.load(f)
+        self._last_signature = current_sig
+    
+    return self._cached_config
+```
+
+## 过滤器在请求流程中的位置
+
+```python
+async def proxy_request(self, request: Request):
+    """处理代理请求"""
+    
+    # 1. Endpoint 过滤（最高优先级）
+    if self.endpoint_filter.should_block(request):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Request blocked"}
+        )
+    
+    # 2. 模型路由
+    target_model = self.model_router.route(request.model)
+    
+    # 3. 负载均衡选择配置
+    config = self.select_config()
+    
+    # 4. 构建请求（应用 Header 和请求体过滤）
+    filtered_headers = self.header_filter.filter(request.headers)
+    filtered_body = self.request_filter.filter(request_body)
+    
+    # 5. 发送到上游
+    response = await self.send_request(
+        config,
+        filtered_headers,
+        filtered_body
+    )
+    
+    # 6-7. 处理响应和记录日志
+    ...
+```
+
+## 过滤器测试
+
+### 单元测试示例
+```python
+import pytest
+from src.filter.endpoint_filter import EndpointFilter
+
+def test_endpoint_filter_exact_match():
+    """测试精确路径匹配"""
+    config = {
+        "enabled": True,
+        "rules": [{
+            "id": "test",
+            "path": "/v1/messages",
+            "pathMatchType": "exact",
+            "action": {"type": "block", "status": 403}
+        }]
+    }
+    
+    filter = EndpointFilter("claude", config)
+    
+    class MockRequest:
+        method = "POST"
+        url = type('obj', (object,), {
+            'path': '/v1/messages',
+            'query': ''
+        })()
+    
+    assert filter.should_block(MockRequest()) == True
+```
+
+### 测试查询参数匹配
+```python
+def test_query_param_match():
+    """测试查询参数匹配"""
+    config = {
+        "enabled": True,
+        "rules": [{
+            "id": "test",
+            "path": "/v1/messages",
+            "pathMatchType": "exact",
+            "query": {"beta": "true"},
+            "action": {"type": "block", "status": 403}
+        }]
+    }
+    
+    filter = EndpointFilter("claude", config)
+    
+    class MockRequest:
+        method = "POST"
+        url = type('obj', (object,), {
+            'path': '/v1/messages',
+            'query': 'beta=true'
+        })()
+    
+    assert filter.should_block(MockRequest()) == True
+```
+
+## 最佳实践
+
+- ✅ Endpoint 过滤用于阻断不需要的请求（最高优先级）
+- ✅ Header 过滤用于移除敏感或无用的请求头
+- ✅ 请求体过滤用于移除/替换敏感数据字段
+- ✅ 所有过滤器支持配置热重载（基于文件签名）
+- ✅ 阻断的请求记录到日志用于审计
+- ✅ 过滤器错误不应中断请求（降级处理）
+- ✅ 正则表达式匹配需要严格测试，避免性能问题
+- ✅ 查询参数匹配区分大小写（根据 HTTP 规范）

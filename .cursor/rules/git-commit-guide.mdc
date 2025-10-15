@@ -1,0 +1,365 @@
+---
+description: Git 提交规范和 PR 流程指南
+---
+
+# Git 提交规范
+
+## Commit Message 格式
+
+采用 Conventional Commits 规范：
+
+```
+<type>(<scope>): <subject>
+
+[可选的详细描述]
+
+[可选的 footer]
+```
+
+### Type 类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| `feat` | 新功能 | `feat(codex): 支持 Header 过滤热重载` |
+| `fix` | Bug 修复 | `fix(proxy): 修复流式响应解析错误` |
+| `docs` | 文档变更 | `docs: 更新鉴权配置说明` |
+| `style` | 代码格式（不影响功能） | `style: 统一缩进为 4 空格` |
+| `refactor` | 重构（不改变功能） | `refactor(filter): 提取公共过滤逻辑` |
+| `perf` | 性能优化 | `perf(proxy): 优化日志写入性能` |
+| `test` | 测试相关 | `test: 添加负载均衡单元测试` |
+| `build` | 构建系统或依赖变更 | `build: 升级 fastapi 到 0.104.0` |
+| `ci` | CI/CD 配置 | `ci: 添加 GitHub Actions 工作流` |
+| `chore` | 其他杂项 | `chore: 更新 .gitignore` |
+
+### Scope 范围
+
+常用范围：
+- `claude` - Claude 服务相关
+- `codex` - Codex 服务相关
+- `ui` - Web UI 相关
+- `filter` - 过滤器系统
+- `config` - 配置管理
+- `auth` - 鉴权系统
+- `core` - 核心基类
+- `cli` - CLI 命令
+- `docs` - 文档
+
+### Subject 主题
+
+- 使用简体中文
+- 简洁明了，不超过 50 字符
+- 使用祈使句（如"添加"而非"添加了"）
+- 首字母小写
+- 末尾不加句号
+
+### 示例
+
+#### 良好的提交消息
+
+```
+feat(claude): 支持 NDJSON 流式响应解析
+
+- 添加 NDJSON 格式检测
+- 实时解析每行的 usage 信息
+- 广播 WebSocket 事件
+
+Closes #123
+```
+
+```
+fix(proxy): 修复负载均衡重试逻辑
+
+当所有配置失败时，应该广播 lb_exhausted 事件，
+而不是抛出异常导致服务中断。
+```
+
+```
+docs: 更新 Nginx 反向代理配置示例
+
+添加流式传输所需的 proxy_buffering off 配置。
+```
+
+#### 不好的提交消息
+
+```
+update code          # 太模糊
+修复bug              # 没有说明修复了什么
+添加了新功能。        # 使用了过去式，末尾有句号
+feat: add feature    # 应使用中文
+```
+
+## 分支管理
+
+### 分支命名
+
+```
+<type>/<issue-number>-<short-description>
+```
+
+示例：
+- `feat/123-add-token-auth` - 新功能：添加 Token 鉴权
+- `fix/456-proxy-timeout` - 修复：代理超时问题
+- `docs/update-readme` - 文档：更新 README
+
+### 主要分支
+
+- `main` / `master` - 生产分支，始终保持稳定
+- `develop` - 开发分支（如果采用 Git Flow）
+- `feat/*` - 功能分支
+- `fix/*` - 修复分支
+- `hotfix/*` - 紧急修复分支
+
+### 工作流程
+
+1. **创建功能分支**
+```bash
+git checkout -b feat/123-add-feature
+```
+
+2. **开发并提交**
+```bash
+git add .
+git commit -m "feat(scope): 添加新功能"
+```
+
+3. **保持分支更新**
+```bash
+git fetch origin
+git rebase origin/main
+```
+
+4. **推送到远程**
+```bash
+git push origin feat/123-add-feature
+```
+
+5. **创建 Pull Request**
+
+## Pull Request 规范
+
+### PR 标题
+
+遵循 Commit Message 格式：
+```
+feat(claude): 支持流式响应 usage 解析
+```
+
+### PR 描述模板
+
+```markdown
+## 变更概述
+简要说明本次 PR 的目的和变更内容。
+
+## 变更类型
+- [ ] 新功能
+- [ ] Bug 修复
+- [ ] 文档更新
+- [ ] 代码重构
+- [ ] 性能优化
+- [ ] 测试改进
+
+## 影响范围
+- [ ] Claude 服务
+- [ ] Codex 服务
+- [ ] Web UI
+- [ ] 过滤器系统
+- [ ] 配置管理
+- [ ] 鉴权系统
+- [ ] CLI 命令
+
+## 测试步骤
+1. 激活虚拟环境: `source clp-env/bin/activate`
+2. 运行测试: `pytest -q`
+3. 手动测试: `clp start && clp status`
+
+## 相关 Issue
+Closes #123
+Fixes #456
+
+## 检查清单
+- [ ] 代码遵循项目规范（绝对导入、类型注解、中文 docstring）
+- [ ] 添加/更新了测试
+- [ ] 更新了相关文档（README.md、CLAUDE.md、Cursor Rules）
+- [ ] 测试通过（pytest -q）
+- [ ] 没有引入新的 linter 错误
+- [ ] 没有提交敏感信息（密钥、~/.clp/* 目录）
+
+## 截图（如有 UI 变更）
+[在此粘贴截图]
+
+## 其他说明
+[补充说明，如性能影响、破坏性变更等]
+```
+
+### PR 审查要点
+
+#### 代码质量
+- ✅ 使用绝对导入 `from src.* import ...`
+- ✅ 函数包含类型注解
+- ✅ 关键函数有中文 docstring
+- ✅ 命名规范（snake_case/PascalCase）
+- ✅ 无硬编码的密钥或敏感信息
+
+#### 功能完整性
+- ✅ 新功能有对应测试
+- ✅ Bug 修复有回归测试
+- ✅ 边界情况已处理
+- ✅ 错误处理得当
+
+#### 文档同步
+- ✅ README.md 已更新（如涉及 CLI、配置、部署）
+- ✅ CLAUDE.md 已更新（如涉及架构、API）
+- ✅ Cursor Rules 已更新（如涉及新模块、规范）
+- ✅ 代码注释清晰
+
+#### 安全与性能
+- ✅ 无 SQL 注入、XSS 等安全风险
+- ✅ 无明显性能问题
+- ✅ 异步操作使用 async/await
+- ✅ 文件 I/O 使用 `asyncio.to_thread`
+
+## Git 工作流最佳实践
+
+### 保持提交原子化
+每次提交只做一件事：
+```bash
+# 好的做法
+git commit -m "feat(filter): 添加 Endpoint 过滤器"
+git commit -m "test(filter): 添加 Endpoint 过滤器测试"
+git commit -m "docs: 更新过滤器文档"
+
+# 不好的做法
+git commit -m "添加过滤器、更新文档、修复 bug"
+```
+
+### 使用 git rebase 整理提交历史
+```bash
+# 交互式 rebase（整理最近 3 次提交）
+git rebase -i HEAD~3
+
+# 可以选择：
+# pick - 保留提交
+# squash - 合并到上一个提交
+# reword - 修改提交消息
+# drop - 删除提交
+```
+
+### 避免强制推送到主分支
+```bash
+# ✗ 危险操作（禁止）
+git push --force origin main
+
+# ✓ 安全操作（功能分支可以）
+git push --force-with-lease origin feat/123-my-feature
+```
+
+### 编写有意义的提交消息
+```bash
+# 使用 git commit（打开编辑器）
+git commit
+
+# 编写多行消息
+# 第一行：简短摘要（50 字符内）
+# 空一行
+# 详细描述：解释"为什么"而非"是什么"
+```
+
+## 提交前检查
+
+### 运行测试
+```bash
+# 激活虚拟环境
+source clp-env/bin/activate
+
+# 运行所有测试
+pytest -q
+
+# 运行特定测试
+pytest tests/unit/test_filters.py -v
+```
+
+### 检查代码格式
+```bash
+# 使用 black 格式化（如果项目配置了）
+black src/ tests/
+
+# 使用 flake8 检查（如果项目配置了）
+flake8 src/ tests/
+```
+
+### 检查导入
+```bash
+# 确保所有导入都是绝对导入
+grep -r "^from \." src/  # 应该无输出
+```
+
+### 检查敏感信息
+```bash
+# 检查是否包含密钥
+git diff --cached | grep -i "sk-ant-\|api[_-]key"
+
+# 检查是否提交了配置目录
+git status | grep ".clp/"
+```
+
+## 常见场景
+
+### 修改最后一次提交
+```bash
+# 修改提交消息
+git commit --amend
+
+# 添加遗漏的文件到最后一次提交
+git add forgotten_file.py
+git commit --amend --no-edit
+```
+
+### 撤销本地更改
+```bash
+# 撤销工作区更改
+git checkout -- file.py
+
+# 撤销暂存区更改
+git reset HEAD file.py
+
+# 撤销最后一次提交（保留更改）
+git reset --soft HEAD^
+
+# 撤销最后一次提交（丢弃更改）
+git reset --hard HEAD^
+```
+
+### 合并冲突处理
+```bash
+# 1. 拉取最新代码
+git fetch origin
+git rebase origin/main
+
+# 2. 解决冲突
+# 编辑冲突文件，移除 <<<<<<< ======= >>>>>>> 标记
+
+# 3. 标记为已解决
+git add resolved_file.py
+
+# 4. 继续 rebase
+git rebase --continue
+```
+
+## 禁止操作
+
+### 绝对禁止
+- ❌ 提交密钥、Token 等敏感信息
+- ❌ 提交 `~/.clp/*` 配置目录
+- ❌ 强制推送到 main/master 分支
+- ❌ 直接在 main/master 分支开发
+
+### 需谨慎
+- ⚠️ 修改已推送的提交历史（除非是个人功能分支）
+- ⚠️ 合并大量未经测试的代码
+- ⚠️ 提交自动生成的文件（如 `__pycache__`）
+
+## 参考资源
+
+- [Conventional Commits](https://www.conventionalcommits.org/)
+- [Git Book](https://git-scm.com/book/zh/v2)
+- [GitHub Flow](https://guides.github.com/introduction/flow/)

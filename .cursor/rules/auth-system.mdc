@@ -1,0 +1,524 @@
+---
+globs: **/auth/*.py
+---
+
+# 鉴权系统规范
+
+## 鉴权架构
+
+CLP 提供 API Token 鉴权功能，采用 Bearer Token 认证方式，通过 `clp_` 前缀区分代理层和上游 API 认证。
+
+## 核心组件
+
+### 1. Token 生成器
+位置: [src/auth/token_generator.py](mdc:src/auth/token_generator.py)
+
+```python
+import secrets
+
+def generate_token() -> str:
+    """
+    生成鉴权 Token
+    
+    格式: clp_ + 32字节随机字符串
+    """
+    random_bytes = secrets.token_urlsafe(32)
+    return f"clp_{random_bytes}"
+```
+
+**Token 格式**:
+- 前缀: `clp_` (4 字符)
+- 随机部分: 32 字节 URL 安全的 Base64 编码
+- 总长度: 约 48 字符
+
+### 2. 鉴权管理器
+位置: [src/auth/auth_manager.py](mdc:src/auth/auth_manager.py)
+
+```python
+from datetime import datetime
+from typing import Optional, Dict, List
+
+class AuthManager:
+    """鉴权管理器"""
+    
+    def __init__(self, config_file: str = "~/.clp/auth.json"):
+        self.config_file = os.path.expanduser(config_file)
+        self.config = self.load_config()
+    
+    def is_enabled(self) -> bool:
+        """检查鉴权是否启用"""
+        return self.config.get("enabled", False)
+    
+    def validate_token(self, token: str, service: str) -> bool:
+        """
+        验证 Token 是否有效
+        
+        Args:
+            token: 待验证的 token
+            service: 服务名称 (ui/claude/codex)
+        
+        Returns:
+            True 如果 token 有效，否则 False
+        """
+        # 检查服务级别的鉴权是否启用
+        if not self.config.get("services", {}).get(service, True):
+            return True  # 该服务未启用鉴权
+        
+        # 查找匹配的 token
+        for token_entry in self.config.get("tokens", []):
+            if not token_entry.get("active", True):
+                continue
+            
+            if token_entry["token"] != token:
+                continue
+            
+            # 检查服务权限
+            allowed_services = token_entry.get("services", [])
+            if service not in allowed_services:
+                return False
+            
+            # 检查过期时间
+            expires_at = token_entry.get("expires_at")
+            if expires_at:
+                if datetime.fromisoformat(expires_at) < datetime.now():
+                    return False
+            
+            return True
+        
+        return False
+    
+    def add_token(
+        self,
+        name: str,
+        services: List[str],
+        description: str = "",
+        expires_at: Optional[str] = None
+    ) -> str:
+        """
+        添加新的 Token
+        
+        Returns:
+            生成的 token 字符串
+        """
+        from src.auth.token_generator import generate_token
+        
+        token = generate_token()
+        
+        token_entry = {
+            "token": token,
+            "name": name,
+            "description": description,
+            "created_at": datetime.now().isoformat(),
+            "expires_at": expires_at,
+            "active": True,
+            "services": services
+        }
+        
+        if "tokens" not in self.config:
+            self.config["tokens"] = []
+        
+        self.config["tokens"].append(token_entry)
+        self.save_config()
+        
+        return token
+```
+
+### 3. FastAPI 中间件
+位置: [src/auth/fastapi_middleware.py](mdc:src/auth/fastapi_middleware.py)
+
+```python
+from fastapi import Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """FastAPI 鉴权中间件"""
+    
+    def __init__(self, app, service_name: str):
+        super().__init__(app)
+        from src.auth.auth_manager import AuthManager
+        self.auth_manager = AuthManager()
+        self.service_name = service_name
+        self.whitelist_paths = [
+            "/health",
+            "/ping",
+            "/favicon.ico"
+        ]
+    
+    async def dispatch(self, request: Request, call_next):
+        # 检查是否启用鉴权
+        if not self.auth_manager.is_enabled():
+            return await call_next(request)
+        
+        # 白名单路径跳过鉴权
+        if request.url.path in self.whitelist_paths:
+            return await call_next(request)
+        
+        # 提取 Token
+        token = self.extract_token(request)
+        
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing authentication token"
+            )
+        
+        # 验证 Token
+        if not self.auth_manager.validate_token(token, self.service_name):
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid or expired token"
+            )
+        
+        return await call_next(request)
+    
+    def extract_token(self, request: Request) -> Optional[str]:
+        """
+        从请求中提取 Token
+        
+        支持两种方式:
+        1. Authorization: Bearer clp_xxx
+        2. X-API-Key: clp_xxx
+        """
+        # 方式 1: Authorization header
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]  # 去掉 "Bearer " 前缀
+            if token.startswith("clp_"):
+                return token
+        
+        # 方式 2: X-API-Key header
+        api_key = request.headers.get("X-API-Key")
+        if api_key and api_key.startswith("clp_"):
+            return api_key
+        
+        return None
+```
+
+### 4. Flask 中间件
+位置: [src/auth/flask_middleware.py](mdc:src/auth/flask_middleware.py)
+
+```python
+from flask import request, jsonify, abort
+from functools import wraps
+
+def require_auth(service_name: str):
+    """Flask 路由装饰器，用于保护需要鉴权的端点"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            from src.auth.auth_manager import AuthManager
+            
+            auth_manager = AuthManager()
+            
+            # 检查是否启用鉴权
+            if not auth_manager.is_enabled():
+                return f(*args, **kwargs)
+            
+            # 白名单路径
+            whitelist = ["/health", "/ping", "/favicon.ico"]
+            if request.path in whitelist or request.path.startswith("/static"):
+                return f(*args, **kwargs)
+            
+            # 提取 Token
+            token = None
+            
+            # 方式 1: Authorization header
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+            
+            # 方式 2: X-API-Key header
+            if not token:
+                token = request.headers.get("X-API-Key")
+            
+            # 方式 3: Query parameter (用于 WebSocket 等场景)
+            if not token:
+                token = request.args.get("token")
+            
+            if not token or not token.startswith("clp_"):
+                abort(401, description="Missing authentication token")
+            
+            # 验证 Token
+            if not auth_manager.validate_token(token, service_name):
+                abort(403, description="Invalid or expired token")
+            
+            return f(*args, **kwargs)
+        
+        return decorated_function
+    return decorator
+
+
+# 使用示例
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/api/configs')
+@require_auth('ui')
+def get_configs():
+    """受保护的 API 端点"""
+    return jsonify({"configs": [...]})
+```
+
+## 配置文件结构
+
+位置: `~/.clp/auth.json`
+
+```json
+{
+  "enabled": true,
+  "tokens": [
+    {
+      "token": "clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+      "name": "production",
+      "description": "生产环境 token",
+      "created_at": "2025-10-15T10:30:00",
+      "expires_at": null,
+      "active": true,
+      "services": ["claude", "codex"]
+    },
+    {
+      "token": "clp_x1y2z3a4b5c6d7e8f9g0h1i2j3k4l5m6",
+      "name": "ui-admin",
+      "description": "UI 管理员 token",
+      "created_at": "2025-10-15T11:00:00",
+      "expires_at": "2025-12-31T23:59:59",
+      "active": true,
+      "services": ["ui"]
+    }
+  ],
+  "services": {
+    "ui": true,
+    "claude": true,
+    "codex": true
+  }
+}
+```
+
+### 配置字段说明
+- `enabled`: 全局鉴权开关
+- `tokens`: Token 列表
+  - `token`: 完整的 token 字符串
+  - `name`: 唯一标识符（用于管理）
+  - `description`: 描述信息
+  - `created_at`: 创建时间（ISO8601）
+  - `expires_at`: 过期时间（ISO8601，null 表示永不过期）
+  - `active`: 是否启用
+  - `services`: 允许访问的服务列表
+- `services`: 各服务的鉴权开关
+
+## CLI 命令实现
+
+在 [src/main.py](mdc:src/main.py) 中实现鉴权管理命令：
+
+```python
+import typer
+
+auth_app = typer.Typer(help="鉴权管理")
+
+@auth_app.command()
+def on():
+    """启用鉴权"""
+    from src.auth.auth_manager import AuthManager
+    
+    manager = AuthManager()
+    manager.enable()
+    print("✓ 鉴权已启用，请重启服务使配置生效")
+
+@auth_app.command()
+def off():
+    """关闭鉴权"""
+    from src.auth.auth_manager import AuthManager
+    
+    manager = AuthManager()
+    manager.disable()
+    print("✓ 鉴权已关闭，请重启服务使配置生效")
+
+@auth_app.command()
+def generate(
+    name: str = typer.Option(..., help="Token 名称"),
+    services: List[str] = typer.Option(..., help="允许的服务"),
+    description: str = typer.Option("", help="描述信息"),
+    expires: Optional[str] = typer.Option(None, help="过期时间 (ISO8601)")
+):
+    """生成新的鉴权 Token"""
+    from src.auth.auth_manager import AuthManager
+    
+    # 验证服务名称
+    valid_services = ["ui", "claude", "codex"]
+    invalid = [s for s in services if s not in valid_services]
+    if invalid:
+        print(f"✗ 无效的服务名称: {', '.join(invalid)}")
+        print(f"  有效服务: {', '.join(valid_services)}")
+        raise typer.Exit(1)
+    
+    manager = AuthManager()
+    token = manager.add_token(name, services, description, expires)
+    
+    print("✓ Token 生成成功！")
+    print(f"名称: {name}")
+    print(f"Token: {token}")
+    print(f"服务: {', '.join(services)}")
+    print()
+    print("请妥善保管此 token，它将用于访问代理服务。")
+
+@auth_app.command()
+def list():
+    """列出所有 Token"""
+    from src.auth.auth_manager import AuthManager
+    
+    manager = AuthManager()
+    config = manager.config
+    
+    print("=== 鉴权 Token 列表 ===")
+    print(f"全局状态: {'已启用' if config.get('enabled') else '已禁用'}")
+    print()
+    
+    tokens = config.get("tokens", [])
+    if not tokens:
+        print("暂无 token")
+        return
+    
+    # 表头
+    print(f"{'名称':<15} {'状态':<8} {'服务':<18} {'创建时间':<20} 描述")
+    print("-" * 82)
+    
+    for token_entry in tokens:
+        name = token_entry["name"]
+        status = "启用" if token_entry.get("active") else "禁用"
+        services = ",".join(token_entry.get("services", []))
+        created = token_entry["created_at"][:19]  # 截取日期时间部分
+        desc = token_entry.get("description", "")
+        
+        print(f"{name:<15} {status:<8} {services:<18} {created:<20} {desc}")
+    
+    print()
+    print(f"共 {len(tokens)} 个 token")
+
+@auth_app.command()
+def disable(name: str):
+    """禁用指定 Token"""
+    from src.auth.auth_manager import AuthManager
+    
+    manager = AuthManager()
+    manager.disable_token(name)
+    print(f"✓ 已禁用 token: {name}")
+
+@auth_app.command()
+def enable(name: str):
+    """启用已禁用的 Token"""
+    from src.auth.auth_manager import AuthManager
+    
+    manager = AuthManager()
+    manager.enable_token(name)
+    print(f"✓ 已启用 token: {name}")
+
+@auth_app.command()
+def remove(name: str):
+    """删除 Token（永久删除）"""
+    from src.auth.auth_manager import AuthManager
+    
+    if not typer.confirm(f"确定要删除 token '{name}' 吗？此操作不可恢复。"):
+        print("已取消")
+        raise typer.Exit()
+    
+    manager = AuthManager()
+    manager.remove_token(name)
+    print(f"✓ 已删除 token: {name}")
+```
+
+## 客户端集成示例
+
+### Python (Anthropic SDK)
+```python
+import anthropic
+
+# 使用 X-API-Key 方式（推荐）
+client = anthropic.Anthropic(
+    base_url="http://your-server:3210",
+    api_key="your-upstream-claude-key",
+    default_headers={
+        "X-API-Key": "clp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+    }
+)
+```
+
+### cURL
+```bash
+# 使用 X-API-Key
+curl http://your-server:3210/v1/messages \
+  -H "X-API-Key: clp_your_token_here" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# 使用 Authorization Bearer
+curl http://your-server:3210/v1/messages \
+  -H "Authorization: Bearer clp_your_token_here" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+## 安全最佳实践
+
+### Token 管理
+- ✅ 使用 `secrets` 模块生成密码学安全的随机 token
+- ✅ Token 长度至少 32 字节（编码后约 43 字符）
+- ✅ 使用 `clp_` 前缀区分代理层和上游 API 认证
+- ✅ 定期轮换 token（建议每 3-6 个月）
+- ✅ 为不同环境（开发/测试/生产）使用不同 token
+- ✅ 为不同服务设置独立 token（最小权限原则）
+
+### 配置文件安全
+- ✅ 设置文件权限为 600（仅所有者可读写）
+- ✅ 不提交 `~/.clp/auth.json` 到版本控制
+- ✅ 定期备份配置文件
+- ✅ 记录 Token 创建和删除操作（审计日志）
+
+### 传输安全
+- ✅ 生产环境使用 HTTPS
+- ✅ 避免在 URL 中传递 token（除 WebSocket 等特殊场景）
+- ✅ 优先使用 `X-API-Key` 头而非 `Authorization`（避免与上游认证冲突）
+
+### 错误处理
+- ✅ 不在错误消息中泄露 token 信息
+- ✅ 认证失败返回通用错误消息（401/403）
+- ✅ 记录认证失败事件（审计用途）
+- ✅ 实现速率限制，防止暴力破解
+
+## 测试示例
+
+```python
+import pytest
+from src.auth.auth_manager import AuthManager
+from src.auth.token_generator import generate_token
+
+def test_token_format():
+    """测试 Token 格式"""
+    token = generate_token()
+    
+    assert token.startswith("clp_")
+    assert len(token) > 40  # clp_ + 至少 36 字符
+
+def test_validate_token():
+    """测试 Token 验证"""
+    manager = AuthManager()
+    
+    # 添加测试 token
+    token = manager.add_token(
+        name="test",
+        services=["claude"],
+        description="测试 token"
+    )
+    
+    # 启用鉴权
+    manager.enable()
+    
+    # 验证成功
+    assert manager.validate_token(token, "claude") == True
+    
+    # 验证失败（服务不匹配）
+    assert manager.validate_token(token, "codex") == False
+    
+    # 验证失败（无效 token）
+    assert manager.validate_token("invalid_token", "claude") == False
+```

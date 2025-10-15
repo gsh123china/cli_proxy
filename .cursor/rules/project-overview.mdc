@@ -1,0 +1,62 @@
+---
+alwaysApply: true
+---
+
+# CLP 项目总览
+
+## 项目简介
+CLP 是一个本地 CLI 代理工具，用于管理和代理 AI 服务（Claude 和 Codex）的 API 请求。主要特性包括配置动态切换、三层敏感数据过滤、智能负载均衡、实时监控和 token 统计。
+
+## 核心架构
+- **入口**: [src/main.py](mdc:src/main.py) - CLI 命令入口，安装后命令为 `clp`
+- **核心基类**:
+  - [src/core/base_proxy.py](mdc:src/core/base_proxy.py) - BaseProxyService（请求处理）和 BaseServiceController（服务管理）
+  - [src/core/realtime_hub.py](mdc:src/core/realtime_hub.py) - RealTimeRequestHub（WebSocket 实时事件广播）
+- **服务实现**:
+  - Claude: [src/claude/](mdc:src/claude/) - 包含 proxy.py, configs.py, ctl.py
+  - Codex: [src/codex/](mdc:src/codex/) - 包含 proxy.py, configs.py, ctl.py
+- **过滤系统**: [src/filter/](mdc:src/filter/) - 三层过滤机制（Endpoint/Header/RequestBody）
+- **UI 界面**: [src/ui/](mdc:src/ui/) - Flask Web UI 和静态资源
+- **配置管理**: [src/config/](mdc:src/config/) - 配置管理器和缓存管理器
+- **鉴权系统**: [src/auth/](mdc:src/auth/) - Token 生成和中间件
+
+## 请求处理流程
+BaseProxyService 实现了 7 个阶段的请求处理：
+1. Endpoint 过滤（最高优先级，命中即阻断）
+2. 模型路由（映射源模型到目标模型）
+3. 负载均衡选配置（按权重/激活模式选择）
+4. 构建请求（应用 Header 和请求体过滤）
+5. 发送到上游（使用 httpx 异步客户端）
+6. 处理响应（支持 SSE/NDJSON 流式响应，自动重试）
+7. 记录日志（异步记录，内存缓存 + 文件持久化）
+
+## 默认端口
+- Claude 代理: 3210
+- Codex 代理: 3211
+- Web UI: 3300
+
+## 配置目录
+- 运行时: `~/.clp/run/` - PID 文件和日志
+- 数据: `~/.clp/data/` - 请求日志和统计数据
+- 配置: `~/.clp/claude.json`, `~/.clp/codex.json`, `~/.clp/filter.json`, `~/.clp/auth.json`
+
+## 技术栈
+- Python 3.7+
+- FastAPI (代理服务，异步)
+- Flask (Web UI)
+- httpx (异步 HTTP 客户端)
+- uvicorn (ASGI 服务器)
+- WebSocket (实时事件推送)
+
+## 开发流程
+1. 创建虚拟环境: `python3 -m venv clp-env`
+2. 激活环境: `source clp-env/bin/activate`
+3. 安装依赖: `pip install -e .`
+4. 运行测试: `pytest -q` 注意：`运行测试`前需要先`激活环境`
+5. 构建发布: `python -m build`
+
+## 重要原则
+- 使用绝对导入: `from src.* import ...`
+- 所有修改需通过工具测试
+- 涉及配置/CLI/安全的变更需更新文档
+- 禁止提交密钥和 `~/.clp/*` 目录

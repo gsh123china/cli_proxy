@@ -1,0 +1,98 @@
+---
+globs: *.py
+---
+
+# Python 代码风格规范
+
+## 基本规则
+- **Python 版本**: 3.7+
+- **编码**: UTF-8
+- **缩进**: 4 空格（不使用 Tab）
+- **换行符**: LF (Unix 风格)
+
+## 命名规范
+- **包和模块**: 小写，单词间用下划线分隔 (例: `base_proxy.py`, `request_filter.py`)
+- **函数和变量**: `snake_case` (例: `get_active_config`, `proxy_requests`)
+- **类名**: `PascalCase` (例: `BaseProxyService`, `ClaudeConfigManager`)
+- **常量**: `UPPER_SNAKE_CASE` (例: `DEFAULT_PORT`, `MAX_LOG_ENTRIES`)
+
+## 类型注解
+- **必须使用**: 函数参数和返回值都应包含类型注解
+- **示例**:
+```python
+def filter_request(data: bytes, config: Dict[str, Any]) -> bytes:
+    """过滤请求数据"""
+    pass
+
+async def proxy_request(
+    request: Request,
+    config: ProxyConfig
+) -> StreamingResponse:
+    """代理请求到上游"""
+    pass
+```
+
+## 文档字符串
+- **风格**: 简洁的中文 docstring
+- **位置**: 模块、类、公开函数都应包含
+- **示例**:
+```python
+def apply_filters(data: bytes, filters: List[Filter]) -> bytes:
+    """
+    按顺序应用所有过滤器
+    
+    Args:
+        data: 原始请求数据
+        filters: 过滤器列表
+        
+    Returns:
+        过滤后的数据
+    """
+    pass
+```
+
+## 导入规范
+- **使用绝对导入**: 从 `src.` 开始
+- **正确示例**: 
+  - `from src.core.base_proxy import BaseProxyService`
+  - `from src.filter.request_filter import RequestFilter`
+- **错误示例**: 
+  - `from core.base_proxy import ...` (缺少 src 前缀)
+  - `from .base_proxy import ...` (避免相对导入)
+
+## 异步编程
+- **优先使用**: async/await 处理 I/O 操作
+- **避免阻塞**: 文件 I/O、日志写入使用 `asyncio.to_thread`
+- **示例**:
+```python
+async def log_request(data: dict) -> None:
+    """异步记录请求日志"""
+    await asyncio.to_thread(write_log_file, data)
+```
+
+## 服务模块结构
+每个服务目录遵循统一命名：
+- `ctl.py` - 服务控制器（继承 BaseServiceController）
+- `configs.py` - 配置管理器
+- `proxy.py` - 代理服务实现（继承 BaseProxyService）
+
+## 错误处理
+- **明确捕获**: 不使用裸 except
+- **记录异常**: 使用 logging 模块记录详细信息
+- **示例**:
+```python
+try:
+    response = await client.post(url, json=data)
+except httpx.TimeoutError as e:
+    logger.error(f"请求超时: {e}")
+    raise
+except httpx.RequestError as e:
+    logger.error(f"请求失败: {e}")
+    raise
+```
+
+## 最佳实践
+- **使用 f-string**: 优先使用 f-string 格式化字符串
+- **列表推导式**: 简单转换使用列表推导，复杂逻辑用显式循环
+- **上下文管理器**: 文件操作使用 `with` 语句
+- **类型检查**: 关键函数添加运行时类型检查（可选）

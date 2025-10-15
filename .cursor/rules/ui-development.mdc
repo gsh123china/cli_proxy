@@ -1,0 +1,465 @@
+---
+globs: **/ui/*.py,**/ui/static/**/*
+---
+
+# UI 开发规范
+
+## UI 技术栈
+- **后端**: Flask (同步 Web 框架)
+- **前端**: 原生 JavaScript + HTML + CSS
+- **实时通信**: WebSocket
+- **静态资源**: [src/ui/static/](mdc:src/ui/static/)
+
+## 项目结构
+```
+src/ui/
+├── ui_server.py        # Flask 服务主文件
+├── ctl.py              # UI 服务控制器
+└── static/             # 静态资源
+    ├── index.html      # 首页
+    ├── config.html     # 配置管理
+    ├── filter.html     # 过滤器配置
+    ├── requests.html   # 请求日志
+    ├── tokens.html     # Token 统计
+    ├── css/            # 样式文件
+    └── js/             # JavaScript 文件
+```
+
+## Flask 服务规范
+
+### 路由定义
+```python
+from flask import Flask, render_template, jsonify, request
+
+app = Flask(__name__, static_folder='static')
+
+@app.route('/')
+def index():
+    """首页"""
+    return app.send_static_file('index.html')
+
+@app.route('/api/status')
+def get_status():
+    """获取服务状态 API"""
+    return jsonify({
+        "claude": check_service("claude"),
+        "codex": check_service("codex"),
+        "ui": True
+    })
+```
+
+### API 响应格式
+```python
+# 成功响应
+{
+    "success": true,
+    "data": {...}
+}
+
+# 错误响应
+{
+    "success": false,
+    "error": "错误消息",
+    "details": {...}  # 可选
+}
+```
+
+### 错误处理
+```python
+@app.errorhandler(404)
+def not_found(error):
+    """404 错误处理"""
+    return jsonify({
+        "success": false,
+        "error": "资源不存在"
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """500 错误处理"""
+    logger.error(f"内部错误: {error}")
+    return jsonify({
+        "success": false,
+        "error": "服务器内部错误"
+    }), 500
+```
+
+## WebSocket 实时通信
+
+### 客户端连接
+```javascript
+// 连接 WebSocket
+const ws = new WebSocket('ws://127.0.0.1:3300/ws');
+
+ws.onopen = () => {
+    console.log('WebSocket 连接已建立');
+};
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    handleRealtimeEvent(data);
+};
+
+ws.onerror = (error) => {
+    console.error('WebSocket 错误:', error);
+};
+
+ws.onclose = () => {
+    console.log('WebSocket 连接已关闭');
+    // 尝试重连
+    setTimeout(connectWebSocket, 5000);
+};
+```
+
+### 事件类型处理
+```javascript
+function handleRealtimeEvent(data) {
+    switch(data.event) {
+        case 'request_started':
+            addRequestToList(data);
+            break;
+
+        case 'request_streaming':
+            updateRequestProgress(data.request_id, data.chunk);
+            break;
+
+        case 'request_completed':
+            markRequestComplete(data.request_id, data.usage);
+            break;
+
+        case 'lb_switch':
+            showLoadBalancerSwitch(data);
+            break;
+
+        default:
+            console.log('未知事件类型:', data.event);
+    }
+}
+```
+
+## 前端开发规范
+
+### HTML 结构
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLP - 配置管理</title>
+    <link rel="stylesheet" href="/static/css/common.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">CLP 代理管理</div>
+        <ul class="nav-menu">
+            <li><a href="/">首页</a></li>
+            <li><a href="/config.html">配置</a></li>
+            <li><a href="/filter.html">过滤器</a></li>
+        </ul>
+    </nav>
+
+    <main class="container">
+        <!-- 页面内容 -->
+    </main>
+
+    <script src="/static/js/common.js"></script>
+    <script src="/static/js/config.js"></script>
+</body>
+</html>
+```
+
+### CSS 命名规范
+- **BEM 风格**: `.block__element--modifier`
+- **语义化类名**: 使用描述性的类名
+- **示例**:
+```css
+/* 配置卡片 */
+.config-card {
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.config-card__header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.config-card__title {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.config-card--active {
+    border-color: #4CAF50;
+    background-color: #f1f8f4;
+}
+```
+
+### JavaScript 规范
+
+#### 变量命名
+```javascript
+// 使用 camelCase
+const configList = [];
+const isActive = true;
+
+// 常量使用 UPPER_SNAKE_CASE
+const API_BASE_URL = '/api';
+const MAX_RETRIES = 3;
+
+// DOM 元素使用 $ 前缀（可选，但推荐）
+const $submitBtn = document.getElementById('submit-btn');
+```
+
+#### 异步请求
+```javascript
+// 使用 async/await
+async function fetchConfigs(service) {
+    try {
+        const response = await fetch(`/api/configs/${service}`);
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error);
+        }
+
+        return data.data;
+    } catch (error) {
+        console.error('获取配置失败:', error);
+        showErrorToast('获取配置失败');
+        return null;
+    }
+}
+```
+
+#### 事件处理
+```javascript
+// 使用事件委托（性能更好）
+document.getElementById('config-list').addEventListener('click', (e) => {
+    if (e.target.classList.contains('delete-btn')) {
+        const configName = e.target.dataset.name;
+        deleteConfig(configName);
+    }
+});
+
+// 防抖处理（搜索框等）
+function debounce(func, delay) {
+    let timeoutId;
+    return function(...args) {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => func.apply(this, args), delay);
+    };
+}
+
+const searchInput = document.getElementById('search');
+searchInput.addEventListener('input', debounce((e) => {
+    filterConfigs(e.target.value);
+}, 300));
+```
+
+## UI 组件示例
+
+### 消息提示（Toast）
+```javascript
+function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    toast.className = `toast toast--${type}`;
+    toast.textContent = message;
+
+    document.body.appendChild(toast);
+
+    // 3 秒后自动消失
+    setTimeout(() => {
+        toast.classList.add('toast--fade-out');
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+// 使用示例
+showToast('配置保存成功', 'success');
+showToast('连接失败', 'error');
+```
+
+### 确认对话框
+```javascript
+function confirm(message) {
+    return new Promise((resolve) => {
+        const modal = document.createElement('div');
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal__content">
+                <p>${message}</p>
+                <div class="modal__actions">
+                    <button class="btn btn--primary" data-action="confirm">确认</button>
+                    <button class="btn btn--secondary" data-action="cancel">取消</button>
+                </div>
+            </div>
+        `;
+
+        modal.addEventListener('click', (e) => {
+            if (e.target.dataset.action === 'confirm') {
+                resolve(true);
+                modal.remove();
+            } else if (e.target.dataset.action === 'cancel') {
+                resolve(false);
+                modal.remove();
+            }
+        });
+
+        document.body.appendChild(modal);
+    });
+}
+
+// 使用示例
+if (await confirm('确定要删除此配置吗？')) {
+    deleteConfig(name);
+}
+```
+
+## 鉴权集成
+
+### 请求头添加 Token
+```javascript
+// 全局配置
+const API_TOKEN = localStorage.getItem('clp_token') || '';
+
+async function apiRequest(url, options = {}) {
+    const headers = {
+        'Content-Type': 'application/json',
+        ...options.headers
+    };
+
+    // 如果启用了鉴权，添加 token
+    if (API_TOKEN) {
+        headers['X-API-Key'] = API_TOKEN;
+    }
+
+    return fetch(url, {
+        ...options,
+        headers
+    });
+}
+```
+
+### WebSocket 鉴权
+```javascript
+// 通过 query 参数传递 token
+const token = localStorage.getItem('clp_token');
+const wsUrl = token
+    ? `ws://127.0.0.1:3300/ws?token=${token}`
+    : 'ws://127.0.0.1:3300/ws';
+
+const ws = new WebSocket(wsUrl);
+```
+
+## 响应式设计
+
+### 媒体查询
+```css
+/* 桌面优先 */
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* 平板 */
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+
+    .config-card {
+        margin-bottom: 15px;
+    }
+}
+
+/* 手机 */
+@media (max-width: 480px) {
+    .navbar {
+        flex-direction: column;
+    }
+
+    .config-card__header {
+        flex-direction: column;
+    }
+}
+```
+
+## 性能优化
+
+### 懒加载
+```javascript
+// 图片懒加载
+const images = document.querySelectorAll('img[data-src]');
+const imageObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            const img = entry.target;
+            img.src = img.dataset.src;
+            imageObserver.unobserve(img);
+        }
+    });
+});
+
+images.forEach(img => imageObserver.observe(img));
+```
+
+### 虚拟滚动（大列表）
+```javascript
+// 仅渲染可见区域的项目
+class VirtualList {
+    constructor(container, items, itemHeight) {
+        this.container = container;
+        this.items = items;
+        this.itemHeight = itemHeight;
+        this.visibleCount = Math.ceil(container.clientHeight / itemHeight);
+
+        this.render(0);
+
+        container.addEventListener('scroll', () => {
+            const scrollTop = container.scrollTop;
+            const startIndex = Math.floor(scrollTop / itemHeight);
+            this.render(startIndex);
+        });
+    }
+
+    render(startIndex) {
+        const endIndex = Math.min(
+            startIndex + this.visibleCount + 1,
+            this.items.length
+        );
+
+        const visibleItems = this.items.slice(startIndex, endIndex);
+
+        this.container.innerHTML = visibleItems
+            .map((item, i) => this.renderItem(item, startIndex + i))
+            .join('');
+    }
+
+    renderItem(item, index) {
+        return `<div class="list-item" style="top: ${index * this.itemHeight}px">${item}</div>`;
+    }
+}
+```
+
+## 最佳实践
+
+- ✅ 使用语义化 HTML 标签（`<nav>`, `<main>`, `<article>`）
+- ✅ CSS 使用 BEM 命名规范，避免嵌套过深
+- ✅ JavaScript 使用 ES6+ 语法（const/let, 箭头函数, async/await）
+- ✅ API 请求统一错误处理和 loading 状态
+- ✅ WebSocket 断线自动重连
+- ✅ 敏感操作添加确认对话框
+- ✅ 长列表使用虚拟滚动或分页
+- ✅ 图片添加 alt 属性，提升可访问性
+- ✅ 移动端适配，使用响应式设计
+- ✅ 避免内联样式，使用 CSS 类
